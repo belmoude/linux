@@ -10,18 +10,18 @@
 
 #include "intel_display_limits.h"
 
-struct drm_i915_private;
-
 struct intel_atomic_state;
+struct intel_connector;
 struct intel_crtc_state;
 
 struct intel_link_bw_limits {
+	u8 force_fec_pipes;
 	u8 bpp_limit_reached_pipes;
 	/* in 1/16 bpp units */
 	int max_bpp_x16[I915_MAX_PIPES];
 };
 
-void intel_link_bw_init_limits(struct drm_i915_private *i915,
+void intel_link_bw_init_limits(struct intel_atomic_state *state,
 			       struct intel_link_bw_limits *limits);
 int intel_link_bw_reduce_bpp(struct intel_atomic_state *state,
 			     struct intel_link_bw_limits *limits,
@@ -33,5 +33,6 @@ bool intel_link_bw_set_bpp_limit_for_pipe(struct intel_atomic_state *state,
 					  enum pipe pipe);
 int intel_link_bw_atomic_check(struct intel_atomic_state *state,
 			       struct intel_link_bw_limits *new_limits);
+void intel_link_bw_connector_debugfs_add(struct intel_connector *connector);
 
 #endif

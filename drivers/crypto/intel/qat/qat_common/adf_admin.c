@@ -449,6 +449,7 @@ int adf_init_admin_pm(struct adf_accel_dev *accel_dev, u32 idle_delay)
 
 	return adf_send_admin(accel_dev, &req, &resp, ae_mask);
 }
+EXPORT_SYMBOL_GPL(adf_init_admin_pm);
 
 int adf_get_pm_info(struct adf_accel_dev *accel_dev, dma_addr_t p_state_addr,
 		    size_t buff_size)
@@ -496,6 +497,43 @@ int adf_get_cnv_stats(struct adf_accel_dev *accel_dev, u16 ae, u16 *err_cnt,
 	*latest_err = resp.latest_error;
 
 	return ret;
+}
+
+int adf_send_admin_tl_start(struct adf_accel_dev *accel_dev,
+			    dma_addr_t tl_dma_addr, size_t layout_sz, u8 *rp_indexes,
+			    struct icp_qat_fw_init_admin_slice_cnt *slice_count)
+{
+	u32 ae_mask = GET_HW_DATA(accel_dev)->admin_ae_mask;
+	struct icp_qat_fw_init_admin_resp resp = { };
+	struct icp_qat_fw_init_admin_req req = { };
+	int ret;
+
+	req.cmd_id = ICP_QAT_FW_TL_START;
+	req.init_cfg_ptr = tl_dma_addr;
+	req.init_cfg_sz = layout_sz;
+
+	if (rp_indexes)
+		memcpy(&req.rp_indexes, rp_indexes, sizeof(req.rp_indexes));
+
+	ret = adf_send_admin(accel_dev, &req, &resp, ae_mask);
+	if (ret)
+		return ret;
+
+	memcpy(slice_count, &resp.slices, sizeof(*slice_count));
+
+	return 0;
+}
+
+int adf_send_admin_tl_stop(struct adf_accel_dev *accel_dev)
+{
+	struct adf_hw_device_data *hw_data = GET_HW_DATA(accel_dev);
+	struct icp_qat_fw_init_admin_resp resp = { };
+	struct icp_qat_fw_init_admin_req req = { };
+	u32 ae_mask = hw_data->admin_ae_mask;
+
+	req.cmd_id = ICP_QAT_FW_TL_STOP;
+
+	return adf_send_admin(accel_dev, &req, &resp, ae_mask);
 }
 
 int adf_init_admin_comms(struct adf_accel_dev *accel_dev)

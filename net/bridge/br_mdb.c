@@ -144,6 +144,8 @@ static void __mdb_entry_fill_flags(struct br_mdb_entry *e, unsigned char flags)
 		e->flags |= MDB_FLAGS_STAR_EXCL;
 	if (flags & MDB_PG_FLAGS_BLOCKED)
 		e->flags |= MDB_FLAGS_BLOCKED;
+	if (flags & MDB_PG_FLAGS_OFFLOAD_FAILED)
+		e->flags |= MDB_FLAGS_OFFLOAD_FAILED;
 }
 
 static void __mdb_entry_to_br_ip(struct br_mdb_entry *entry, struct br_ip *ip,
@@ -517,16 +519,17 @@ static size_t rtnl_mdb_nlmsg_size(const struct net_bridge_port_group *pg)
 	       rtnl_mdb_nlmsg_pg_size(pg);
 }
 
-void br_mdb_notify(struct net_device *dev,
-		   struct net_bridge_mdb_entry *mp,
-		   struct net_bridge_port_group *pg,
-		   int type)
+static void __br_mdb_notify(struct net_device *dev,
+			    struct net_bridge_mdb_entry *mp,
+			    struct net_bridge_port_group *pg,
+			    int type, bool notify_switchdev)
 {
 	struct net *net = dev_net(dev);
 	struct sk_buff *skb;
 	int err = -ENOBUFS;
 
-	br_switchdev_mdb_notify(dev, mp, pg, type);
+	if (notify_switchdev)
+		br_switchdev_mdb_notify(dev, mp, pg, type);
 
 	skb = nlmsg_new(rtnl_mdb_nlmsg_size(pg), GFP_ATOMIC);
 	if (!skb)
@@ -542,6 +545,21 @@ void br_mdb_notify(struct net_device *dev,
 	return;
 errout:
 	rtnl_set_sk_err(net, RTNLGRP_MDB, err);
+}
+
+void br_mdb_notify(struct net_device *dev,
+		   struct net_bridge_mdb_entry *mp,
+		   struct net_bridge_port_group *pg,
+		   int type)
+{
+	__br_mdb_notify(dev, mp, pg, type, true);
+}
+
+void br_mdb_flag_change_notify(struct net_device *dev,
+			       struct net_bridge_mdb_entry *mp,
+			       struct net_bridge_port_group *pg)
+{
+	__br_mdb_notify(dev, mp, pg, RTM_NEWMDB, false);
 }
 
 static int nlmsg_populate_rtr_fill(struct sk_buff *skb,
@@ -732,7 +750,7 @@ static int br_mdb_replace_group_sg(const struct br_mdb_config *cfg,
 		mod_timer(&pg->timer,
 			  now + brmctx->multicast_membership_interval);
 	else
-		del_timer(&pg->timer);
+		timer_delete(&pg->timer);
 
 	br_mdb_notify(cfg->br->dev, mp, pg, RTM_NEWMDB);
 
@@ -853,7 +871,7 @@ static int br_mdb_add_group_src(const struct br_mdb_config *cfg,
 	    cfg->entry->state == MDB_TEMPORARY)
 		mod_timer(&ent->timer, now + br_multicast_gmi(brmctx));
 	else
-		del_timer(&ent->timer);
+		timer_delete(&ent->timer);
 
 	/* Install a (S, G) forwarding entry for the source. */
 	err = br_mdb_add_group_src_fwd(cfg, &src->addr, brmctx, extack);
@@ -953,7 +971,7 @@ static int br_mdb_replace_group_star_g(const struct br_mdb_config *cfg,
 		mod_timer(&pg->timer,
 			  now + brmctx->multicast_membership_interval);
 	else
-		del_timer(&pg->timer);
+		timer_delete(&pg->timer);
 
 	br_mdb_notify(cfg->br->dev, mp, pg, RTM_NEWMDB);
 
@@ -1040,7 +1058,7 @@ static int br_mdb_add_group(const struct br_mdb_config *cfg,
 
 	/* host join */
 	if (!port) {
-		if (mp->host_joined) {
+		if (mp->host_joined && !(cfg->nlflags & NLM_F_REPLACE)) {
 			NL_SET_ERR_MSG_MOD(extack, "Group is already joined by host");
 			return -EEXIST;
 		}
@@ -1412,6 +1430,139 @@ int br_mdb_del(struct net_device *dev, struct nlattr *tb[],
 	return err;
 }
 
+struct br_mdb_flush_desc {
+	u32 port_ifindex;
+	u16 vid;
+	u8 rt_protocol;
+	u8 state;
+	u8 state_mask;
+};
+
+static const struct nla_policy br_mdbe_attrs_del_bulk_pol[MDBE_ATTR_MAX + 1] = {
+	[MDBE_ATTR_RTPROT] = NLA_POLICY_MIN(NLA_U8, RTPROT_STATIC),
+	[MDBE_ATTR_STATE_MASK] = NLA_POLICY_MASK(NLA_U8, MDB_PERMANENT),
+};
+
+static int br_mdb_flush_desc_init(struct br_mdb_flush_desc *desc,
+				  struct nlattr *tb[],
+				  struct netlink_ext_ack *extack)
+{
+	struct br_mdb_entry *entry = nla_data(tb[MDBA_SET_ENTRY]);
+	struct nlattr *mdbe_attrs[MDBE_ATTR_MAX + 1];
+	int err;
+
+	desc->port_ifindex = entry->ifindex;
+	desc->vid = entry->vid;
+	desc->state = entry->state;
+
+	if (!tb[MDBA_SET_ENTRY_ATTRS])
+		return 0;
+
+	err = nla_parse_nested(mdbe_attrs, MDBE_ATTR_MAX,
+			       tb[MDBA_SET_ENTRY_ATTRS],
+			       br_mdbe_attrs_del_bulk_pol, extack);
+	if (err)
+		return err;
+
+	if (mdbe_attrs[MDBE_ATTR_STATE_MASK])
+		desc->state_mask = nla_get_u8(mdbe_attrs[MDBE_ATTR_STATE_MASK]);
+
+	if (mdbe_attrs[MDBE_ATTR_RTPROT])
+		desc->rt_protocol = nla_get_u8(mdbe_attrs[MDBE_ATTR_RTPROT]);
+
+	return 0;
+}
+
+static void br_mdb_flush_host(struct net_bridge *br,
+			      struct net_bridge_mdb_entry *mp,
+			      const struct br_mdb_flush_desc *desc)
+{
+	u8 state;
+
+	if (desc->port_ifindex && desc->port_ifindex != br->dev->ifindex)
+		return;
+
+	if (desc->rt_protocol)
+		return;
+
+	state = br_group_is_l2(&mp->addr) ? MDB_PERMANENT : 0;
+	if (desc->state_mask && (state & desc->state_mask) != desc->state)
+		return;
+
+	br_multicast_host_leave(mp, true);
+	if (!mp->ports && netif_running(br->dev))
+		mod_timer(&mp->timer, jiffies);
+}
+
+static void br_mdb_flush_pgs(struct net_bridge *br,
+			     struct net_bridge_mdb_entry *mp,
+			     const struct br_mdb_flush_desc *desc)
+{
+	struct net_bridge_port_group __rcu **pp;
+	struct net_bridge_port_group *p;
+
+	for (pp = &mp->ports; (p = mlock_dereference(*pp, br)) != NULL;) {
+		u8 state;
+
+		if (desc->port_ifindex &&
+		    desc->port_ifindex != p->key.port->dev->ifindex) {
+			pp = &p->next;
+			continue;
+		}
+
+		if (desc->rt_protocol && desc->rt_protocol != p->rt_protocol) {
+			pp = &p->next;
+			continue;
+		}
+
+		state = p->flags & MDB_PG_FLAGS_PERMANENT ? MDB_PERMANENT : 0;
+		if (desc->state_mask &&
+		    (state & desc->state_mask) != desc->state) {
+			pp = &p->next;
+			continue;
+		}
+
+		br_multicast_del_pg(mp, p, pp);
+	}
+}
+
+static void br_mdb_flush(struct net_bridge *br,
+			 const struct br_mdb_flush_desc *desc)
+{
+	struct net_bridge_mdb_entry *mp;
+
+	spin_lock_bh(&br->multicast_lock);
+
+	/* Safe variant is not needed because entries are removed from the list
+	 * upon group timer expiration or bridge deletion.
+	 */
+	hlist_for_each_entry(mp, &br->mdb_list, mdb_node) {
+		if (desc->vid && desc->vid != mp->addr.vid)
+			continue;
+
+		br_mdb_flush_host(br, mp, desc);
+		br_mdb_flush_pgs(br, mp, desc);
+	}
+
+	spin_unlock_bh(&br->multicast_lock);
+}
+
+int br_mdb_del_bulk(struct net_device *dev, struct nlattr *tb[],
+		    struct netlink_ext_ack *extack)
+{
+	struct net_bridge *br = netdev_priv(dev);
+	struct br_mdb_flush_desc desc = {};
+	int err;
+
+	err = br_mdb_flush_desc_init(&desc, tb, extack);
+	if (err)
+		return err;
+
+	br_mdb_flush(br, &desc);
+
+	return 0;
+}
+
 static const struct nla_policy br_mdbe_attrs_get_pol[MDBE_ATTR_MAX + 1] = {
 	[MDBE_ATTR_SOURCE] = NLA_POLICY_RANGE(NLA_BINARY,
 					      sizeof(struct in_addr),
@@ -1541,7 +1692,7 @@ int br_mdb_get(struct net_device *dev, struct nlattr *tb[], u32 portid, u32 seq,
 	spin_lock_bh(&br->multicast_lock);
 
 	mp = br_mdb_ip_get(br, &group);
-	if (!mp) {
+	if (!mp || (!mp->ports && !mp->host_joined)) {
 		NL_SET_ERR_MSG_MOD(extack, "MDB entry not found");
 		err = -ENOENT;
 		goto unlock;

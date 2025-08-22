@@ -7,14 +7,12 @@ Assorted Miscellaneous Devices Documentation
 This documentation contains information for assorted devices that do not
 fit into other categories.
 
-.. class:: toc-title
-
-	   Table of contents
-
 .. toctree::
+   :caption: Table of contents
    :maxdepth: 2
 
    ad525x_dpot
+   amd-sbi
    apds990x
    bh1770glc
    c2port
@@ -24,6 +22,7 @@ fit into other categories.
    isl29003
    lis3lv02d
    max6875
+   mrvl_cn10k_dpi
    oxsemi-tornado
    pci-endpoint-test
    spear-pcie-gadget

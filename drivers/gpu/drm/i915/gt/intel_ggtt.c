@@ -9,10 +9,9 @@
 #include <linux/stop_machine.h>
 
 #include <drm/drm_managed.h>
-#include <drm/i915_drm.h>
-#include <drm/intel-gtt.h>
+#include <drm/intel/i915_drm.h>
+#include <drm/intel/intel-gtt.h>
 
-#include "display/intel_display.h"
 #include "gem/i915_gem_lmem.h"
 
 #include "intel_context.h"
@@ -24,6 +23,7 @@
 #include "intel_ring.h"
 #include "i915_drv.h"
 #include "i915_pci.h"
+#include "i915_reg.h"
 #include "i915_request.h"
 #include "i915_scatterlist.h"
 #include "i915_utils.h"
@@ -107,11 +107,12 @@ int i915_ggtt_init_hw(struct drm_i915_private *i915)
 /**
  * i915_ggtt_suspend_vm - Suspend the memory mappings for a GGTT or DPT VM
  * @vm: The VM to suspend the mappings for
+ * @evict_all: Evict all VMAs
  *
  * Suspend the memory mappings for all objects mapped to HW via the GGTT or a
  * DPT page table.
  */
-void i915_ggtt_suspend_vm(struct i915_address_space *vm)
+void i915_ggtt_suspend_vm(struct i915_address_space *vm, bool evict_all)
 {
 	struct i915_vma *vma, *vn;
 	int save_skip_rewrite;
@@ -157,7 +158,7 @@ retry:
 			goto retry;
 		}
 
-		if (!i915_vma_is_bound(vma, I915_VMA_GLOBAL_BIND)) {
+		if (evict_all || !i915_vma_is_bound(vma, I915_VMA_GLOBAL_BIND)) {
 			i915_vma_wait_for_bind(vma);
 
 			__i915_vma_evict(vma, false);
@@ -172,13 +173,15 @@ retry:
 	vm->skip_pte_rewrite = save_skip_rewrite;
 
 	mutex_unlock(&vm->mutex);
+
+	drm_WARN_ON(&vm->i915->drm, evict_all && !list_empty(&vm->bound_list));
 }
 
 void i915_ggtt_suspend(struct i915_ggtt *ggtt)
 {
 	struct intel_gt *gt;
 
-	i915_ggtt_suspend_vm(&ggtt->vm);
+	i915_ggtt_suspend_vm(&ggtt->vm, false);
 	ggtt->invalidate(ggtt);
 
 	list_for_each_entry(gt, &ggtt->gt_list, ggtt_link)
@@ -230,11 +233,8 @@ static void guc_ggtt_ct_invalidate(struct intel_gt *gt)
 	struct intel_uncore *uncore = gt->uncore;
 	intel_wakeref_t wakeref;
 
-	with_intel_runtime_pm_if_active(uncore->rpm, wakeref) {
-		struct intel_guc *guc = &gt->uc.guc;
-
-		intel_guc_invalidate_tlb_guc(guc);
-	}
+	with_intel_runtime_pm_if_active(uncore->rpm, wakeref)
+		intel_guc_invalidate_tlb_guc(gt_to_guc(gt));
 }
 
 static void guc_ggtt_invalidate(struct i915_ggtt *ggtt)
@@ -245,16 +245,15 @@ static void guc_ggtt_invalidate(struct i915_ggtt *ggtt)
 	gen8_ggtt_invalidate(ggtt);
 
 	list_for_each_entry(gt, &ggtt->gt_list, ggtt_link) {
-		if (intel_guc_tlb_invalidation_is_available(&gt->uc.guc)) {
+		if (intel_guc_tlb_invalidation_is_available(gt_to_guc(gt)))
 			guc_ggtt_ct_invalidate(gt);
-		} else if (GRAPHICS_VER(i915) >= 12) {
+		else if (GRAPHICS_VER(i915) >= 12)
 			intel_uncore_write_fw(gt->uncore,
 					      GEN12_GUC_TLB_INV_CR,
 					      GEN12_GUC_TLB_INV_CR_INVALIDATE);
-		} else {
+		else
 			intel_uncore_write_fw(gt->uncore,
 					      GEN8_GTCR, GEN8_GTCR_INVALIDATE);
-		}
 	}
 }
 
@@ -290,6 +289,14 @@ u64 gen8_ggtt_pte_encode(dma_addr_t addr,
 	return pte;
 }
 
+static dma_addr_t gen8_ggtt_pte_decode(u64 pte, bool *is_present, bool *is_local)
+{
+	*is_present = pte & GEN8_PAGE_PRESENT;
+	*is_local = pte & GEN12_GGTT_PTE_LM;
+
+	return pte & GEN12_GGTT_PTE_ADDR_MASK;
+}
+
 static bool should_update_ggtt_with_bind(struct i915_ggtt *ggtt)
 {
 	struct intel_gt *gt = ggtt->vm.gt;
@@ -297,7 +304,7 @@ static bool should_update_ggtt_with_bind(struct i915_ggtt *ggtt)
 	return intel_gt_is_bind_context_ready(gt);
 }
 
-static struct intel_context *gen8_ggtt_bind_get_ce(struct i915_ggtt *ggtt)
+static struct intel_context *gen8_ggtt_bind_get_ce(struct i915_ggtt *ggtt, intel_wakeref_t *wakeref)
 {
 	struct intel_context *ce;
 	struct intel_gt *gt = ggtt->vm.gt;
@@ -314,7 +321,8 @@ static struct intel_context *gen8_ggtt_bind_get_ce(struct i915_ggtt *ggtt)
 	 * would conflict with fs_reclaim trying to allocate memory while
 	 * doing rpm_resume().
 	 */
-	if (!intel_gt_pm_get_if_awake(gt))
+	*wakeref = intel_gt_pm_get_if_awake(gt);
+	if (!*wakeref)
 		return NULL;
 
 	intel_engine_pm_get(ce->engine);
@@ -322,10 +330,10 @@ static struct intel_context *gen8_ggtt_bind_get_ce(struct i915_ggtt *ggtt)
 	return ce;
 }
 
-static void gen8_ggtt_bind_put_ce(struct intel_context *ce)
+static void gen8_ggtt_bind_put_ce(struct intel_context *ce, intel_wakeref_t wakeref)
 {
 	intel_engine_pm_put(ce->engine);
-	intel_gt_pm_put(ce->engine->gt);
+	intel_gt_pm_put(ce->engine->gt, wakeref);
 }
 
 static bool gen8_ggtt_bind_ptes(struct i915_ggtt *ggtt, u32 offset,
@@ -338,12 +346,13 @@ static bool gen8_ggtt_bind_ptes(struct i915_ggtt *ggtt, u32 offset,
 	struct sgt_iter iter;
 	struct i915_request *rq;
 	struct intel_context *ce;
+	intel_wakeref_t wakeref;
 	u32 *cs;
 
 	if (!num_entries)
 		return true;
 
-	ce = gen8_ggtt_bind_get_ce(ggtt);
+	ce = gen8_ggtt_bind_get_ce(ggtt, &wakeref);
 	if (!ce)
 		return false;
 
@@ -419,19 +428,24 @@ queue_err_rq:
 		offset += n_ptes;
 	}
 
-	gen8_ggtt_bind_put_ce(ce);
+	gen8_ggtt_bind_put_ce(ce, wakeref);
 	return true;
 
 err_rq:
 	i915_request_put(rq);
 put_ce:
-	gen8_ggtt_bind_put_ce(ce);
+	gen8_ggtt_bind_put_ce(ce, wakeref);
 	return false;
 }
 
 static void gen8_set_pte(void __iomem *addr, gen8_pte_t pte)
 {
 	writeq(pte, addr);
+}
+
+static gen8_pte_t gen8_get_pte(void __iomem *addr)
+{
+	return readq(addr);
 }
 
 static void gen8_ggtt_insert_page(struct i915_address_space *vm,
@@ -447,6 +461,16 @@ static void gen8_ggtt_insert_page(struct i915_address_space *vm,
 	gen8_set_pte(pte, ggtt->vm.pte_encode(addr, pat_index, flags));
 
 	ggtt->invalidate(ggtt);
+}
+
+static dma_addr_t gen8_ggtt_read_entry(struct i915_address_space *vm,
+				       u64 offset, bool *is_present, bool *is_local)
+{
+	struct i915_ggtt *ggtt = i915_vm_to_ggtt(vm);
+	gen8_pte_t __iomem *pte =
+		(gen8_pte_t __iomem *)ggtt->gsm + offset / I915_GTT_PAGE_SIZE;
+
+	return ggtt->vm.pte_decode(gen8_get_pte(pte), is_present, is_local);
 }
 
 static void gen8_ggtt_insert_page_bind(struct i915_address_space *vm,
@@ -602,6 +626,17 @@ static void gen6_ggtt_insert_page(struct i915_address_space *vm,
 	iowrite32(vm->pte_encode(addr, pat_index, flags), pte);
 
 	ggtt->invalidate(ggtt);
+}
+
+static dma_addr_t gen6_ggtt_read_entry(struct i915_address_space *vm,
+				       u64 offset,
+				       bool *is_present, bool *is_local)
+{
+	struct i915_ggtt *ggtt = i915_vm_to_ggtt(vm);
+	gen6_pte_t __iomem *pte =
+		(gen6_pte_t __iomem *)ggtt->gsm + offset / I915_GTT_PAGE_SIZE;
+
+	return vm->pte_decode(ioread32(pte), is_present, is_local);
 }
 
 /*
@@ -766,6 +801,14 @@ void intel_ggtt_unbind_vma(struct i915_address_space *vm,
 			   struct i915_vma_resource *vma_res)
 {
 	vm->clear_range(vm, vma_res->start, vma_res->vma_size);
+}
+
+dma_addr_t intel_ggtt_read_entry(struct i915_address_space *vm,
+				 u64 offset, bool *is_present, bool *is_local)
+{
+	struct i915_ggtt *ggtt = i915_vm_to_ggtt(vm);
+
+	return ggtt->vm.read_entry(vm, offset, is_present, is_local);
 }
 
 /*
@@ -1151,13 +1194,20 @@ static unsigned int gen6_gttadr_offset(struct drm_i915_private *i915)
 static int ggtt_probe_common(struct i915_ggtt *ggtt, u64 size)
 {
 	struct drm_i915_private *i915 = ggtt->vm.i915;
+	struct intel_uncore *uncore = ggtt->vm.gt->uncore;
 	struct pci_dev *pdev = to_pci_dev(i915->drm.dev);
 	phys_addr_t phys_addr;
 	u32 pte_flags;
 	int ret;
 
 	GEM_WARN_ON(pci_resource_len(pdev, GEN4_GTTMMADR_BAR) != gen6_gttmmadr_size(i915));
-	phys_addr = pci_resource_start(pdev, GEN4_GTTMMADR_BAR) + gen6_gttadr_offset(i915);
+
+	if (i915_direct_stolen_access(i915)) {
+		drm_dbg(&i915->drm, "Using direct GSM access\n");
+		phys_addr = intel_uncore_read64(uncore, GEN6_GSMBASE) & GEN11_BDSM_MASK;
+	} else {
+		phys_addr = pci_resource_start(pdev, GEN4_GTTMMADR_BAR) + gen6_gttadr_offset(i915);
+	}
 
 	if (needs_wc_ggtt_mapping(i915))
 		ggtt->gsm = ioremap_wc(phys_addr, size);
@@ -1237,6 +1287,7 @@ static int gen8_gmch_probe(struct i915_ggtt *ggtt)
 	ggtt->vm.scratch_range = gen8_ggtt_clear_range;
 
 	ggtt->vm.insert_entries = gen8_ggtt_insert_entries;
+	ggtt->vm.read_entry = gen8_ggtt_read_entry;
 
 	/*
 	 * Serialize GTT updates with aperture access on BXT if VT-d is on,
@@ -1282,6 +1333,8 @@ static int gen8_gmch_probe(struct i915_ggtt *ggtt)
 		ggtt->vm.pte_encode = mtl_ggtt_pte_encode;
 	else
 		ggtt->vm.pte_encode = gen8_ggtt_pte_encode;
+
+	ggtt->vm.pte_decode = gen8_ggtt_pte_decode;
 
 	return ggtt_probe_common(ggtt, size);
 }
@@ -1382,6 +1435,14 @@ static u64 iris_pte_encode(dma_addr_t addr,
 	return pte;
 }
 
+static dma_addr_t gen6_pte_decode(u64 pte, bool *is_present, bool *is_local)
+{
+	*is_present = pte & GEN6_PTE_VALID;
+	*is_local = false;
+
+	return ((pte & 0xff0) << 28) | (pte & ~0xfff);
+}
+
 static int gen6_gmch_probe(struct i915_ggtt *ggtt)
 {
 	struct drm_i915_private *i915 = ggtt->vm.i915;
@@ -1420,6 +1481,7 @@ static int gen6_gmch_probe(struct i915_ggtt *ggtt)
 	ggtt->vm.scratch_range = gen6_ggtt_clear_range;
 	ggtt->vm.insert_page = gen6_ggtt_insert_page;
 	ggtt->vm.insert_entries = gen6_ggtt_insert_entries;
+	ggtt->vm.read_entry = gen6_ggtt_read_entry;
 	ggtt->vm.cleanup = gen6_gmch_remove;
 
 	ggtt->invalidate = gen6_ggtt_invalidate;
@@ -1434,6 +1496,8 @@ static int gen6_gmch_probe(struct i915_ggtt *ggtt)
 		ggtt->vm.pte_encode = ivb_pte_encode;
 	else
 		ggtt->vm.pte_encode = snb_pte_encode;
+
+	ggtt->vm.pte_decode = gen6_pte_decode;
 
 	ggtt->vm.vma_ops.bind_vma    = intel_ggtt_bind_vma;
 	ggtt->vm.vma_ops.unbind_vma  = intel_ggtt_unbind_vma;
@@ -1540,6 +1604,7 @@ int i915_ggtt_enable_hw(struct drm_i915_private *i915)
 /**
  * i915_ggtt_resume_vm - Restore the memory mappings for a GGTT or DPT VM
  * @vm: The VM to restore the mappings for
+ * @all_evicted: Were all VMAs expected to be evicted on suspend?
  *
  * Restore the memory mappings for all objects mapped to HW via the GGTT or a
  * DPT page table.
@@ -1547,12 +1612,17 @@ int i915_ggtt_enable_hw(struct drm_i915_private *i915)
  * Returns %true if restoring the mapping for any object that was in a write
  * domain before suspend.
  */
-bool i915_ggtt_resume_vm(struct i915_address_space *vm)
+bool i915_ggtt_resume_vm(struct i915_address_space *vm, bool all_evicted)
 {
 	struct i915_vma *vma;
 	bool write_domain_objs = false;
 
 	drm_WARN_ON(&vm->i915->drm, !vm->is_ggtt && !vm->is_dpt);
+
+	if (all_evicted) {
+		drm_WARN_ON(&vm->i915->drm, !list_empty(&vm->bound_list));
+		return false;
+	}
 
 	/* First fill our portion of the GTT with scratch pages */
 	vm->clear_range(vm, 0, vm->total);
@@ -1593,7 +1663,7 @@ void i915_ggtt_resume(struct i915_ggtt *ggtt)
 	list_for_each_entry(gt, &ggtt->gt_list, ggtt_link)
 		intel_gt_check_and_clear_faults(gt);
 
-	flush = i915_ggtt_resume_vm(&ggtt->vm);
+	flush = i915_ggtt_resume_vm(&ggtt->vm, false);
 
 	if (drm_mm_node_allocated(&ggtt->error_capture))
 		ggtt->vm.scratch_range(&ggtt->vm, ggtt->error_capture.start,

@@ -45,7 +45,32 @@ struct bch_csum bch2_checksum(struct bch_fs *, unsigned, struct nonce,
 	bch2_checksum(_c, _type, _nonce, _start, vstruct_end(_i) - _start);\
 })
 
-int bch2_chacha_encrypt_key(struct bch_key *, struct nonce, void *, size_t);
+static inline void bch2_csum_to_text(struct printbuf *out,
+				     enum bch_csum_type type,
+				     struct bch_csum csum)
+{
+	const u8 *p = (u8 *) &csum;
+	unsigned bytes = type < BCH_CSUM_NR ? bch_crc_bytes[type] : 16;
+
+	for (unsigned i = 0; i < bytes; i++)
+		prt_hex_byte(out, p[i]);
+}
+
+static inline void bch2_csum_err_msg(struct printbuf *out,
+				     enum bch_csum_type type,
+				     struct bch_csum expected,
+				     struct bch_csum got)
+{
+	prt_str(out, "checksum error, type ");
+	bch2_prt_csum_type(out, type);
+	prt_str(out, ": got ");
+	bch2_csum_to_text(out, type, got);
+	prt_str(out, " should be ");
+	bch2_csum_to_text(out, type, expected);
+}
+
+void bch2_chacha20(const struct bch_key *, struct nonce, void *, size_t);
+
 int bch2_request_key(struct bch_sb *, struct bch_key *);
 #ifndef __KERNEL__
 int bch2_revoke_key(struct bch_sb *);
@@ -79,13 +104,15 @@ extern const struct bch_sb_field_ops bch_sb_field_ops_crypt;
 int bch2_decrypt_sb_key(struct bch_fs *, struct bch_sb_field_crypt *,
 			struct bch_key *);
 
+#if 0
 int bch2_disable_encryption(struct bch_fs *);
 int bch2_enable_encryption(struct bch_fs *, bool);
+#endif
 
 void bch2_fs_encryption_exit(struct bch_fs *);
 int bch2_fs_encryption_init(struct bch_fs *);
 
-static inline enum bch_csum_type bch2_csum_opt_to_type(enum bch_csum_opts type,
+static inline enum bch_csum_type bch2_csum_opt_to_type(enum bch_csum_opt type,
 						       bool data)
 {
 	switch (type) {
@@ -130,7 +157,7 @@ static inline bool bch2_checksum_type_valid(const struct bch_fs *c,
 	if (type >= BCH_CSUM_NR)
 		return false;
 
-	if (bch2_csum_type_is_encryption(type) && !c->chacha20)
+	if (bch2_csum_type_is_encryption(type) && !c->chacha20_key_set)
 		return false;
 
 	return true;

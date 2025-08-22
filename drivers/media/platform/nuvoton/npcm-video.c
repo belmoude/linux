@@ -26,7 +26,6 @@
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/sched.h>
-#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/v4l2-controls.h>
 #include <linux/videodev2.h>
@@ -120,7 +119,7 @@ struct npcm_video {
 	struct mutex video_lock; /* v4l2 and videobuf2 lock */
 
 	struct list_head buffers;
-	spinlock_t lock; /* buffer list lock */
+	struct mutex buffer_lock; /* buffer list lock */
 	unsigned long flags;
 	unsigned int sequence;
 
@@ -393,7 +392,7 @@ static void npcm_video_free_diff_table(struct npcm_video *video)
 	struct rect_list *tmp;
 	unsigned int i;
 
-	for (i = 0; i < video->queue.num_buffers; i++) {
+	for (i = 0; i < vb2_get_num_buffers(&video->queue); i++) {
 		head = &video->list[i];
 		list_for_each_safe(pos, nx, head) {
 			tmp = list_entry(pos, struct rect_list, list);
@@ -579,7 +578,7 @@ static unsigned int npcm_video_hres(struct npcm_video *video)
 	regmap_read(gfxi, HVCNTL, &hvcntl);
 	apb_hor_res = (((hvcnth & HVCNTH_MASK) << 8) + (hvcntl & HVCNTL_MASK) + 1);
 
-	return apb_hor_res;
+	return (apb_hor_res > MAX_WIDTH) ? MAX_WIDTH : apb_hor_res;
 }
 
 static unsigned int npcm_video_vres(struct npcm_video *video)
@@ -592,7 +591,7 @@ static unsigned int npcm_video_vres(struct npcm_video *video)
 
 	apb_ver_res = (((vvcnth & VVCNTH_MASK) << 8) + (vvcntl & VVCNTL_MASK));
 
-	return apb_ver_res;
+	return (apb_ver_res > MAX_HEIGHT) ? MAX_HEIGHT : apb_ver_res;
 }
 
 static int npcm_video_capres(struct npcm_video *video, unsigned int hor_res,
@@ -782,7 +781,6 @@ static int npcm_video_start_frame(struct npcm_video *video)
 {
 	struct npcm_video_buffer *buf;
 	struct regmap *vcd = video->vcd_regmap;
-	unsigned long flags;
 	unsigned int val;
 	int ret;
 
@@ -798,17 +796,17 @@ static int npcm_video_start_frame(struct npcm_video *video)
 		return -EBUSY;
 	}
 
-	spin_lock_irqsave(&video->lock, flags);
+	mutex_lock(&video->buffer_lock);
 	buf = list_first_entry_or_null(&video->buffers,
 				       struct npcm_video_buffer, link);
 	if (!buf) {
-		spin_unlock_irqrestore(&video->lock, flags);
+		mutex_unlock(&video->buffer_lock);
 		dev_dbg(video->dev, "No empty buffers; skip capture frame\n");
 		return 0;
 	}
 
 	set_bit(VIDEO_CAPTURING, &video->flags);
-	spin_unlock_irqrestore(&video->lock, flags);
+	mutex_unlock(&video->buffer_lock);
 
 	npcm_video_vcd_state_machine_reset(video);
 
@@ -834,14 +832,13 @@ static void npcm_video_bufs_done(struct npcm_video *video,
 				 enum vb2_buffer_state state)
 {
 	struct npcm_video_buffer *buf;
-	unsigned long flags;
 
-	spin_lock_irqsave(&video->lock, flags);
+	mutex_lock(&video->buffer_lock);
 	list_for_each_entry(buf, &video->buffers, link)
 		vb2_buffer_done(&buf->vb.vb2_buf, state);
 
 	INIT_LIST_HEAD(&video->buffers);
-	spin_unlock_irqrestore(&video->lock, flags);
+	mutex_unlock(&video->buffer_lock);
 }
 
 static void npcm_video_get_diff_rect(struct npcm_video *video, unsigned int index)
@@ -866,7 +863,6 @@ static void npcm_video_detect_resolution(struct npcm_video *video)
 	struct regmap *gfxi = video->gfx_regmap;
 	unsigned int dispst;
 
-	video->v4l2_input_status = V4L2_IN_ST_NO_SIGNAL;
 	det->width = npcm_video_hres(video);
 	det->height = npcm_video_vres(video);
 
@@ -895,12 +891,16 @@ static void npcm_video_detect_resolution(struct npcm_video *video)
 		clear_bit(VIDEO_RES_CHANGING, &video->flags);
 	}
 
-	if (det->width && det->height)
+	if (det->width && det->height) {
 		video->v4l2_input_status = 0;
-
-	dev_dbg(video->dev, "Got resolution[%dx%d] -> [%dx%d], status %d\n",
-		act->width, act->height, det->width, det->height,
-		video->v4l2_input_status);
+		dev_dbg(video->dev, "Got resolution[%dx%d] -> [%dx%d], status %d\n",
+			act->width, act->height, det->width, det->height,
+			video->v4l2_input_status);
+	} else {
+		video->v4l2_input_status = V4L2_IN_ST_NO_SIGNAL;
+		dev_err(video->dev, "Got invalid resolution[%dx%d]\n", det->width,
+			det->height);
+	}
 }
 
 static int npcm_video_set_resolution(struct npcm_video *video,
@@ -1071,12 +1071,12 @@ static irqreturn_t npcm_video_irq(int irq, void *arg)
 
 	if (status & VCD_STAT_DONE) {
 		regmap_write(vcd, VCD_INTE, 0);
-		spin_lock(&video->lock);
+		mutex_lock(&video->buffer_lock);
 		clear_bit(VIDEO_CAPTURING, &video->flags);
 		buf = list_first_entry_or_null(&video->buffers,
 					       struct npcm_video_buffer, link);
 		if (!buf) {
-			spin_unlock(&video->lock);
+			mutex_unlock(&video->buffer_lock);
 			return IRQ_NONE;
 		}
 
@@ -1093,7 +1093,7 @@ static irqreturn_t npcm_video_irq(int irq, void *arg)
 			size = npcm_video_hextile(video, index, dma_addr, addr);
 			break;
 		default:
-			spin_unlock(&video->lock);
+			mutex_unlock(&video->buffer_lock);
 			return IRQ_NONE;
 		}
 
@@ -1104,7 +1104,7 @@ static irqreturn_t npcm_video_irq(int irq, void *arg)
 
 		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 		list_del(&buf->link);
-		spin_unlock(&video->lock);
+		mutex_unlock(&video->buffer_lock);
 
 		if (npcm_video_start_frame(video))
 			dev_err(video->dev, "Failed to capture next frame\n");
@@ -1508,13 +1508,12 @@ static void npcm_video_buf_queue(struct vb2_buffer *vb)
 	struct npcm_video *video = vb2_get_drv_priv(vb->vb2_queue);
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 	struct npcm_video_buffer *nvb = to_npcm_video_buffer(vbuf);
-	unsigned long flags;
 	bool empty;
 
-	spin_lock_irqsave(&video->lock, flags);
+	mutex_lock(&video->buffer_lock);
 	empty = list_empty(&video->buffers);
 	list_add_tail(&nvb->link, &video->buffers);
-	spin_unlock_irqrestore(&video->lock, flags);
+	mutex_unlock(&video->buffer_lock);
 
 	if (test_bit(VIDEO_STREAMING, &video->flags) &&
 	    !test_bit(VIDEO_CAPTURING, &video->flags) && empty) {
@@ -1562,8 +1561,6 @@ static const struct regmap_config npcm_video_ece_regmap_cfg = {
 
 static const struct vb2_ops npcm_video_vb2_ops = {
 	.queue_setup = npcm_video_queue_setup,
-	.wait_prepare = vb2_ops_wait_prepare,
-	.wait_finish = vb2_ops_wait_finish,
 	.buf_prepare = npcm_video_buf_prepare,
 	.buf_finish = npcm_video_buf_finish,
 	.start_streaming = npcm_video_start_streaming,
@@ -1616,7 +1613,7 @@ static int npcm_video_setup_video(struct npcm_video *video)
 	vbq->drv_priv = video;
 	vbq->buf_struct_size = sizeof(struct npcm_video_buffer);
 	vbq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-	vbq->min_buffers_needed = 3;
+	vbq->min_queued_buffers = 3;
 
 	rc = vb2_queue_init(vbq);
 	if (rc) {
@@ -1654,8 +1651,8 @@ rel_ctrl_handler:
 
 static int npcm_video_ece_init(struct npcm_video *video)
 {
+	struct device_node *ece_node __free(device_node) = NULL;
 	struct device *dev = video->dev;
-	struct device_node *ece_node;
 	struct platform_device *ece_pdev;
 	void __iomem *regs;
 
@@ -1671,11 +1668,11 @@ static int npcm_video_ece_init(struct npcm_video *video)
 		dev_info(dev, "Support HEXTILE pixel format\n");
 
 		ece_pdev = of_find_device_by_node(ece_node);
-		if (IS_ERR(ece_pdev)) {
+		if (!ece_pdev) {
 			dev_err(dev, "Failed to find ECE device\n");
-			return PTR_ERR(ece_pdev);
+			return -ENODEV;
 		}
-		of_node_put(ece_node);
+		struct device *ece_dev __free(put_device) = &ece_pdev->dev;
 
 		regs = devm_platform_ioremap_resource(ece_pdev, 0);
 		if (IS_ERR(regs)) {
@@ -1690,7 +1687,7 @@ static int npcm_video_ece_init(struct npcm_video *video)
 			return PTR_ERR(video->ece.regmap);
 		}
 
-		video->ece.reset = devm_reset_control_get(&ece_pdev->dev, NULL);
+		video->ece.reset = devm_reset_control_get(ece_dev, NULL);
 		if (IS_ERR(video->ece.reset)) {
 			dev_err(dev, "Failed to get ECE reset control in DTS\n");
 			return PTR_ERR(video->ece.reset);
@@ -1744,8 +1741,8 @@ static int npcm_video_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	video->dev = &pdev->dev;
-	spin_lock_init(&video->lock);
 	mutex_init(&video->video_lock);
+	mutex_init(&video->buffer_lock);
 	INIT_LIST_HEAD(&video->buffers);
 
 	regs = devm_platform_ioremap_resource(pdev, 0);
@@ -1789,7 +1786,7 @@ static int npcm_video_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int npcm_video_remove(struct platform_device *pdev)
+static void npcm_video_remove(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct v4l2_device *v4l2_dev = dev_get_drvdata(dev);
@@ -1802,8 +1799,6 @@ static int npcm_video_remove(struct platform_device *pdev)
 	if (video->ece.enable)
 		npcm_video_ece_stop(video);
 	of_reserved_mem_device_release(dev);
-
-	return 0;
 }
 
 static const struct of_device_id npcm_video_match[] = {

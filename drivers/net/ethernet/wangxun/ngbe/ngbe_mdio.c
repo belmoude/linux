@@ -7,7 +7,9 @@
 #include <linux/phy.h>
 
 #include "../libwx/wx_type.h"
+#include "../libwx/wx_ptp.h"
 #include "../libwx/wx_hw.h"
+#include "../libwx/wx_sriov.h"
 #include "ngbe_type.h"
 #include "ngbe_mdio.h"
 
@@ -56,22 +58,35 @@ static int ngbe_phy_write_reg_c22(struct mii_bus *bus, int phy_addr,
 	return ret;
 }
 
-static void ngbe_handle_link_change(struct net_device *dev)
+static void ngbe_mac_config(struct phylink_config *config, unsigned int mode,
+			    const struct phylink_link_state *state)
 {
-	struct wx *wx = netdev_priv(dev);
-	struct phy_device *phydev;
+}
+
+static void ngbe_mac_link_down(struct phylink_config *config,
+			       unsigned int mode, phy_interface_t interface)
+{
+	struct wx *wx = phylink_to_wx(config);
+
+	wx->speed = SPEED_UNKNOWN;
+	if (test_bit(WX_STATE_PTP_RUNNING, wx->state))
+		wx_ptp_reset_cyclecounter(wx);
+	/* ping all the active vfs to let them know we are going down */
+	wx_ping_all_vfs_with_link_status(wx, false);
+}
+
+static void ngbe_mac_link_up(struct phylink_config *config,
+			     struct phy_device *phy,
+			     unsigned int mode, phy_interface_t interface,
+			     int speed, int duplex,
+			     bool tx_pause, bool rx_pause)
+{
+	struct wx *wx = phylink_to_wx(config);
 	u32 lan_speed, reg;
 
-	phydev = wx->phydev;
-	if (!(wx->link != phydev->link ||
-	      wx->speed != phydev->speed ||
-	      wx->duplex != phydev->duplex))
-		return;
+	wx_fc_enable(wx, tx_pause, rx_pause);
 
-	wx->link = phydev->link;
-	wx->speed = phydev->speed;
-	wx->duplex = phydev->duplex;
-	switch (phydev->speed) {
+	switch (speed) {
 	case SPEED_10:
 		lan_speed = 0;
 		break;
@@ -83,54 +98,62 @@ static void ngbe_handle_link_change(struct net_device *dev)
 		lan_speed = 2;
 		break;
 	}
+
 	wr32m(wx, NGBE_CFG_LAN_SPEED, 0x3, lan_speed);
 
-	if (phydev->link) {
-		reg = rd32(wx, WX_MAC_TX_CFG);
-		reg &= ~WX_MAC_TX_CFG_SPEED_MASK;
-		reg |= WX_MAC_TX_CFG_SPEED_1G | WX_MAC_TX_CFG_TE;
-		wr32(wx, WX_MAC_TX_CFG, reg);
-		/* Re configure MAC RX */
-		reg = rd32(wx, WX_MAC_RX_CFG);
-		wr32(wx, WX_MAC_RX_CFG, reg);
-		wr32(wx, WX_MAC_PKT_FLT, WX_MAC_PKT_FLT_PR);
-		reg = rd32(wx, WX_MAC_WDG_TIMEOUT);
-		wr32(wx, WX_MAC_WDG_TIMEOUT, reg);
-	}
-	phy_print_status(phydev);
+	reg = rd32(wx, WX_MAC_TX_CFG);
+	reg &= ~WX_MAC_TX_CFG_SPEED_MASK;
+	reg |= WX_MAC_TX_CFG_SPEED_1G | WX_MAC_TX_CFG_TE;
+	wr32(wx, WX_MAC_TX_CFG, reg);
+
+	/* Re configure MAC Rx */
+	reg = rd32(wx, WX_MAC_RX_CFG);
+	wr32(wx, WX_MAC_RX_CFG, reg);
+	wr32(wx, WX_MAC_PKT_FLT, WX_MAC_PKT_FLT_PR);
+	reg = rd32(wx, WX_MAC_WDG_TIMEOUT);
+	wr32(wx, WX_MAC_WDG_TIMEOUT, reg);
+
+	wx->speed = speed;
+	wx->last_rx_ptp_check = jiffies;
+	if (test_bit(WX_STATE_PTP_RUNNING, wx->state))
+		wx_ptp_reset_cyclecounter(wx);
+	/* ping all the active vfs to let them know we are going up */
+	wx_ping_all_vfs_with_link_status(wx, true);
 }
 
-int ngbe_phy_connect(struct wx *wx)
-{
-	int ret;
+static const struct phylink_mac_ops ngbe_mac_ops = {
+	.mac_config = ngbe_mac_config,
+	.mac_link_down = ngbe_mac_link_down,
+	.mac_link_up = ngbe_mac_link_up,
+};
 
-	ret = phy_connect_direct(wx->netdev,
-				 wx->phydev,
-				 ngbe_handle_link_change,
-				 PHY_INTERFACE_MODE_RGMII_ID);
-	if (ret) {
-		wx_err(wx, "PHY connect failed.\n");
-		return ret;
-	}
+static int ngbe_phylink_init(struct wx *wx)
+{
+	struct phylink_config *config;
+	phy_interface_t phy_mode;
+	struct phylink *phylink;
+
+	config = &wx->phylink_config;
+	config->dev = &wx->netdev->dev;
+	config->type = PHYLINK_NETDEV;
+	config->mac_capabilities = MAC_1000FD | MAC_100FD | MAC_10FD |
+				   MAC_SYM_PAUSE | MAC_ASYM_PAUSE;
+	config->mac_managed_pm = true;
+
+	/* The MAC only has add the Tx delay and it can not be modified.
+	 * So just disable TX delay in PHY, and it is does not matter to
+	 * internal phy.
+	 */
+	phy_mode = PHY_INTERFACE_MODE_RGMII_RXID;
+	__set_bit(PHY_INTERFACE_MODE_RGMII_RXID, config->supported_interfaces);
+
+	phylink = phylink_create(config, NULL, phy_mode, &ngbe_mac_ops);
+	if (IS_ERR(phylink))
+		return PTR_ERR(phylink);
+
+	wx->phylink = phylink;
 
 	return 0;
-}
-
-static void ngbe_phy_fixup(struct wx *wx)
-{
-	struct phy_device *phydev = wx->phydev;
-	struct ethtool_eee eee;
-
-	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_10baseT_Half_BIT);
-	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_100baseT_Half_BIT);
-	phy_remove_link_mode(phydev, ETHTOOL_LINK_MODE_1000baseT_Half_BIT);
-
-	phydev->mac_managed_pm = true;
-	if (wx->mac_type != em_mac_type_mdi)
-		return;
-	/* disable EEE, internal phy does not support eee */
-	memset(&eee, 0, sizeof(eee));
-	phy_ethtool_set_eee(phydev, &eee);
 }
 
 int ngbe_mdio_init(struct wx *wx)
@@ -165,11 +188,16 @@ int ngbe_mdio_init(struct wx *wx)
 		return -ENODEV;
 
 	phy_attached_info(wx->phydev);
-	ngbe_phy_fixup(wx);
 
 	wx->link = 0;
 	wx->speed = 0;
 	wx->duplex = 0;
+
+	ret = ngbe_phylink_init(wx);
+	if (ret) {
+		wx_err(wx, "failed to init phylink: %d\n", ret);
+		return ret;
+	}
 
 	return 0;
 }

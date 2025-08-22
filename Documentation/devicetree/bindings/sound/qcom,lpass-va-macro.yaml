@@ -11,12 +11,19 @@ maintainers:
 
 properties:
   compatible:
-    enum:
-      - qcom,sc7280-lpass-va-macro
-      - qcom,sm8250-lpass-va-macro
-      - qcom,sm8450-lpass-va-macro
-      - qcom,sm8550-lpass-va-macro
-      - qcom,sc8280xp-lpass-va-macro
+    oneOf:
+      - enum:
+          - qcom,sc7280-lpass-va-macro
+          - qcom,sm8250-lpass-va-macro
+          - qcom,sm8450-lpass-va-macro
+          - qcom,sm8550-lpass-va-macro
+          - qcom,sc8280xp-lpass-va-macro
+      - items:
+          - enum:
+              - qcom,sm8650-lpass-va-macro
+              - qcom,sm8750-lpass-va-macro
+              - qcom,x1e80100-lpass-va-macro
+          - const: qcom,sm8550-lpass-va-macro
 
   reg:
     maxItems: 1
@@ -33,7 +40,11 @@ properties:
 
   clock-names:
     minItems: 1
-    maxItems: 4
+    items:
+      - const: mclk
+      - const: macro
+      - const: dcodec
+      - const: npl
 
   clock-output-names:
     maxItems: 1
@@ -73,8 +84,7 @@ allOf:
         clocks:
           maxItems: 1
         clock-names:
-          items:
-            - const: mclk
+          maxItems: 1
 
   - if:
       properties:
@@ -87,10 +97,8 @@ allOf:
           minItems: 3
           maxItems: 3
         clock-names:
-          items:
-            - const: mclk
-            - const: macro
-            - const: dcodec
+          minItems: 3
+          maxItems: 3
 
   - if:
       properties:
@@ -105,11 +113,8 @@ allOf:
           minItems: 4
           maxItems: 4
         clock-names:
-          items:
-            - const: mclk
-            - const: macro
-            - const: dcodec
-            - const: npl
+          minItems: 4
+          maxItems: 4
 
   - if:
       properties:
@@ -123,10 +128,8 @@ allOf:
           minItems: 3
           maxItems: 3
         clock-names:
-          items:
-            - const: mclk
-            - const: macro
-            - const: dcodec
+          minItems: 3
+          maxItems: 3
 
 unevaluatedProperties: false
 

@@ -46,6 +46,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/bitmap.h>
 #include <linux/bits.h>
 #include <linux/cleanup.h>
 #include <linux/clk.h>
@@ -141,7 +142,7 @@ struct ad2s1210_state {
 	struct spi_device *sdev;
 	/** GPIO pin connected to SAMPLE line. */
 	struct gpio_desc *sample_gpio;
-	/** GPIO pins connected to A0 and A1 lines. */
+	/** GPIO pins connected to A0 and A1 lines (optional). */
 	struct gpio_descs *mode_gpios;
 	/** Used to access config registers. */
 	struct regmap *regmap;
@@ -149,6 +150,8 @@ struct ad2s1210_state {
 	unsigned long clkin_hz;
 	/** Available raw hysteresis values based on resolution. */
 	int hysteresis_available[2];
+	/* adi,fixed-mode property - only valid when mode_gpios == NULL. */
+	enum ad2s1210_mode fixed_mode;
 	/** The selected resolution */
 	enum ad2s1210_resolution resolution;
 	/** Copy of fault register from the previous read. */
@@ -162,7 +165,7 @@ struct ad2s1210_state {
 	struct {
 		__be16 chan[2];
 		/* Ensure timestamp is naturally aligned. */
-		s64 timestamp __aligned(8);
+		aligned_s64 timestamp;
 	} scan;
 	/** SPI transmit buffer. */
 	u8 rx[2];
@@ -173,12 +176,14 @@ struct ad2s1210_state {
 static int ad2s1210_set_mode(struct ad2s1210_state *st, enum ad2s1210_mode mode)
 {
 	struct gpio_descs *gpios = st->mode_gpios;
-	DECLARE_BITMAP(bitmap, 2);
+	DECLARE_BITMAP(bitmap, 2) = { };
 
-	bitmap[0] = mode;
+	if (!gpios)
+		return mode == st->fixed_mode ? 0 : -EOPNOTSUPP;
 
-	return gpiod_set_array_value(gpios->ndescs, gpios->desc, gpios->info,
-				     bitmap);
+	bitmap_write(bitmap, mode, 0, 2);
+
+	return gpiod_multi_set_value_cansleep(gpios, bitmap);
 }
 
 /*
@@ -276,7 +281,8 @@ static int ad2s1210_regmap_reg_read(void *context, unsigned int reg,
 	 * parity error. The fault register is read-only and the D7 bit means
 	 * something else there.
 	 */
-	if (reg != AD2S1210_REG_FAULT && st->rx[1] & AD2S1210_ADDRESS_DATA)
+	if ((reg > AD2S1210_REG_VELOCITY_LSB && reg != AD2S1210_REG_FAULT)
+	     && st->rx[1] & AD2S1210_ADDRESS_DATA)
 		return -EBADMSG;
 
 	*val = st->rx[1];
@@ -450,21 +456,53 @@ static int ad2s1210_single_conversion(struct iio_dev *indio_dev,
 	ad2s1210_toggle_sample_line(st);
 	timestamp = iio_get_time_ns(indio_dev);
 
-	switch (chan->type) {
-	case IIO_ANGL:
-		ret = ad2s1210_set_mode(st, MOD_POS);
-		break;
-	case IIO_ANGL_VEL:
-		ret = ad2s1210_set_mode(st, MOD_VEL);
-		break;
-	default:
-		return -EINVAL;
+	if (st->fixed_mode == MOD_CONFIG) {
+		unsigned int reg_val;
+
+		switch (chan->type) {
+		case IIO_ANGL:
+			ret = regmap_bulk_read(st->regmap,
+					       AD2S1210_REG_POSITION_MSB,
+					       &st->sample.raw, 2);
+			if (ret < 0)
+				return ret;
+
+			break;
+		case IIO_ANGL_VEL:
+			ret = regmap_bulk_read(st->regmap,
+					       AD2S1210_REG_VELOCITY_MSB,
+					       &st->sample.raw, 2);
+			if (ret < 0)
+				return ret;
+
+			break;
+		default:
+			return -EINVAL;
+		}
+
+		ret = regmap_read(st->regmap, AD2S1210_REG_FAULT, &reg_val);
+		if (ret < 0)
+			return ret;
+
+		st->sample.fault = reg_val;
+	} else {
+		switch (chan->type) {
+		case IIO_ANGL:
+			ret = ad2s1210_set_mode(st, MOD_POS);
+			break;
+		case IIO_ANGL_VEL:
+			ret = ad2s1210_set_mode(st, MOD_VEL);
+			break;
+		default:
+			return -EINVAL;
+		}
+		if (ret < 0)
+			return ret;
+
+		ret = spi_read(st->sdev, &st->sample, 3);
+		if (ret < 0)
+			return ret;
 	}
-	if (ret < 0)
-		return ret;
-	ret = spi_read(st->sdev, &st->sample, 3);
-	if (ret < 0)
-		return ret;
 
 	switch (chan->type) {
 	case IIO_ANGL:
@@ -1252,31 +1290,58 @@ static irqreturn_t ad2s1210_trigger_handler(int irq, void *p)
 	ad2s1210_toggle_sample_line(st);
 
 	if (test_bit(0, indio_dev->active_scan_mask)) {
-		ret = ad2s1210_set_mode(st, MOD_POS);
-		if (ret < 0)
-			goto error_ret;
+		if (st->fixed_mode == MOD_CONFIG) {
+			ret = regmap_bulk_read(st->regmap,
+					       AD2S1210_REG_POSITION_MSB,
+					       &st->sample.raw, 2);
+			if (ret < 0)
+				goto error_ret;
+		} else {
+			ret = ad2s1210_set_mode(st, MOD_POS);
+			if (ret < 0)
+				goto error_ret;
 
-		ret = spi_read(st->sdev, &st->sample, 3);
-		if (ret < 0)
-			goto error_ret;
+			ret = spi_read(st->sdev, &st->sample, 3);
+			if (ret < 0)
+				goto error_ret;
+		}
 
 		memcpy(&st->scan.chan[chan++], &st->sample.raw, 2);
 	}
 
 	if (test_bit(1, indio_dev->active_scan_mask)) {
-		ret = ad2s1210_set_mode(st, MOD_VEL);
-		if (ret < 0)
-			goto error_ret;
+		if (st->fixed_mode == MOD_CONFIG) {
+			ret = regmap_bulk_read(st->regmap,
+					       AD2S1210_REG_VELOCITY_MSB,
+					       &st->sample.raw, 2);
+			if (ret < 0)
+				goto error_ret;
+		} else {
+			ret = ad2s1210_set_mode(st, MOD_VEL);
+			if (ret < 0)
+				goto error_ret;
 
-		ret = spi_read(st->sdev, &st->sample, 3);
-		if (ret < 0)
-			goto error_ret;
+			ret = spi_read(st->sdev, &st->sample, 3);
+			if (ret < 0)
+				goto error_ret;
+		}
 
 		memcpy(&st->scan.chan[chan++], &st->sample.raw, 2);
 	}
 
+	if (st->fixed_mode == MOD_CONFIG) {
+		unsigned int reg_val;
+
+		ret = regmap_read(st->regmap, AD2S1210_REG_FAULT, &reg_val);
+		if (ret < 0)
+			return ret;
+
+		st->sample.fault = reg_val;
+	}
+
 	ad2s1210_push_events(indio_dev, st->sample.fault, pf->timestamp);
-	iio_push_to_buffers_with_timestamp(indio_dev, &st->scan, pf->timestamp);
+	iio_push_to_buffers_with_ts(indio_dev, &st->scan, sizeof(st->scan),
+				    pf->timestamp);
 
 error_ret:
 	iio_trigger_notify_done(indio_dev->trig);
@@ -1299,8 +1364,23 @@ static const struct iio_info ad2s1210_info = {
 static int ad2s1210_setup_properties(struct ad2s1210_state *st)
 {
 	struct device *dev = &st->sdev->dev;
+	const char *str_val;
 	u32 val;
 	int ret;
+
+	ret = device_property_read_string(dev, "adi,fixed-mode", &str_val);
+	if (ret == -EINVAL)
+		st->fixed_mode = -1;
+	else if (ret < 0)
+		return dev_err_probe(dev, ret,
+			"failed to read adi,fixed-mode property\n");
+	else {
+		if (strcmp(str_val, "config"))
+			return dev_err_probe(dev, -EINVAL,
+				"only adi,fixed-mode=\"config\" is supported\n");
+
+		st->fixed_mode = MOD_CONFIG;
+	}
 
 	ret = device_property_read_u32(dev, "assigned-resolution-bits", &val);
 	if (ret < 0)
@@ -1347,7 +1427,8 @@ static int ad2s1210_setup_gpios(struct ad2s1210_state *st)
 {
 	struct device *dev = &st->sdev->dev;
 	struct gpio_descs *resolution_gpios;
-	DECLARE_BITMAP(bitmap, 2);
+	struct gpio_desc *reset_gpio;
+	DECLARE_BITMAP(bitmap, 2) = { };
 	int ret;
 
 	/* should not be sampling on startup */
@@ -1357,12 +1438,21 @@ static int ad2s1210_setup_gpios(struct ad2s1210_state *st)
 				     "failed to request sample GPIO\n");
 
 	/* both pins high means that we start in config mode */
-	st->mode_gpios = devm_gpiod_get_array(dev, "mode", GPIOD_OUT_HIGH);
+	st->mode_gpios = devm_gpiod_get_array_optional(dev, "mode",
+						       GPIOD_OUT_HIGH);
 	if (IS_ERR(st->mode_gpios))
 		return dev_err_probe(dev, PTR_ERR(st->mode_gpios),
 				     "failed to request mode GPIOs\n");
 
-	if (st->mode_gpios->ndescs != 2)
+	if (!st->mode_gpios && st->fixed_mode == -1)
+		return dev_err_probe(dev, -EINVAL,
+			"must specify either adi,fixed-mode or mode-gpios\n");
+
+	if (st->mode_gpios && st->fixed_mode != -1)
+		return dev_err_probe(dev, -EINVAL,
+			"must specify only one of adi,fixed-mode or mode-gpios\n");
+
+	if (st->mode_gpios && st->mode_gpios->ndescs != 2)
 		return dev_err_probe(dev, -EINVAL,
 				     "requires exactly 2 mode-gpios\n");
 
@@ -1382,15 +1472,23 @@ static int ad2s1210_setup_gpios(struct ad2s1210_state *st)
 			return dev_err_probe(dev, -EINVAL,
 				      "requires exactly 2 resolution-gpios\n");
 
-		bitmap[0] = st->resolution;
+		bitmap_write(bitmap, st->resolution, 0, 2);
 
-		ret = gpiod_set_array_value(resolution_gpios->ndescs,
-					    resolution_gpios->desc,
-					    resolution_gpios->info,
-					    bitmap);
+		ret = gpiod_multi_set_value_cansleep(resolution_gpios, bitmap);
 		if (ret < 0)
 			return dev_err_probe(dev, ret,
 					     "failed to set resolution gpios\n");
+	}
+
+	/* If the optional reset GPIO is present, toggle it to do a hard reset. */
+	reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(reset_gpio))
+		return dev_err_probe(dev, PTR_ERR(reset_gpio),
+				     "failed to request reset GPIO\n");
+
+	if (reset_gpio) {
+		udelay(10);
+		gpiod_set_value(reset_gpio, 0);
 	}
 
 	return 0;
@@ -1500,7 +1598,7 @@ MODULE_DEVICE_TABLE(of, ad2s1210_of_match);
 
 static const struct spi_device_id ad2s1210_id[] = {
 	{ "ad2s1210" },
-	{}
+	{ }
 };
 MODULE_DEVICE_TABLE(spi, ad2s1210_id);
 

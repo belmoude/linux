@@ -14,7 +14,7 @@
 #include <linux/skbuff.h>
 #include <linux/netdevice.h>
 #include <linux/if_vlan.h>
-#include <linux/random.h>
+#include <linux/prandom.h>
 #include <linux/highmem.h>
 #include <linux/sched.h>
 
@@ -478,7 +478,7 @@ static int __bpf_ld_imm64(struct bpf_insn insns[2], u8 reg, s64 imm64)
  * to overflow the field size of the native instruction, triggering
  * a branch conversion mechanism in some JITs.
  */
-static int __bpf_fill_max_jmp(struct bpf_test *self, int jmp, int imm)
+static int __bpf_fill_max_jmp(struct bpf_test *self, int jmp, int imm, bool alu32)
 {
 	struct bpf_insn *insns;
 	int len = S16_MAX + 5;
@@ -501,7 +501,7 @@ static int __bpf_fill_max_jmp(struct bpf_test *self, int jmp, int imm)
 		};
 		int op = ops[(i >> 1) % ARRAY_SIZE(ops)];
 
-		if (i & 1)
+		if ((i & 1) || alu32)
 			insns[i++] = BPF_ALU32_REG(op, R0, R1);
 		else
 			insns[i++] = BPF_ALU64_REG(op, R0, R1);
@@ -516,27 +516,47 @@ static int __bpf_fill_max_jmp(struct bpf_test *self, int jmp, int imm)
 }
 
 /* Branch taken by runtime decision */
+static int bpf_fill_max_jmp_taken_32(struct bpf_test *self)
+{
+	return __bpf_fill_max_jmp(self, BPF_JEQ, 1, true);
+}
+
 static int bpf_fill_max_jmp_taken(struct bpf_test *self)
 {
-	return __bpf_fill_max_jmp(self, BPF_JEQ, 1);
+	return __bpf_fill_max_jmp(self, BPF_JEQ, 1, false);
 }
 
 /* Branch not taken by runtime decision */
+static int bpf_fill_max_jmp_not_taken_32(struct bpf_test *self)
+{
+	return __bpf_fill_max_jmp(self, BPF_JEQ, 0, true);
+}
+
 static int bpf_fill_max_jmp_not_taken(struct bpf_test *self)
 {
-	return __bpf_fill_max_jmp(self, BPF_JEQ, 0);
+	return __bpf_fill_max_jmp(self, BPF_JEQ, 0, false);
 }
 
 /* Branch always taken, known at JIT time */
+static int bpf_fill_max_jmp_always_taken_32(struct bpf_test *self)
+{
+	return __bpf_fill_max_jmp(self, BPF_JGE, 0, true);
+}
+
 static int bpf_fill_max_jmp_always_taken(struct bpf_test *self)
 {
-	return __bpf_fill_max_jmp(self, BPF_JGE, 0);
+	return __bpf_fill_max_jmp(self, BPF_JGE, 0, false);
 }
 
 /* Branch never taken, known at JIT time */
+static int bpf_fill_max_jmp_never_taken_32(struct bpf_test *self)
+{
+	return __bpf_fill_max_jmp(self, BPF_JLT, 0, true);
+}
+
 static int bpf_fill_max_jmp_never_taken(struct bpf_test *self)
 {
-	return __bpf_fill_max_jmp(self, BPF_JLT, 0);
+	return __bpf_fill_max_jmp(self, BPF_JLT, 0, false);
 }
 
 /* ALU result computation used in tests */
@@ -1740,7 +1760,7 @@ static int __bpf_emit_cmpxchg32(struct bpf_test *self, void *arg,
 	/* Result unsuccessful */
 	insns[i++] = BPF_STX_MEM(BPF_W, R10, R1, -4);
 	insns[i++] = BPF_ATOMIC_OP(BPF_W, BPF_CMPXCHG, R10, R2, -4);
-	insns[i++] = BPF_ZEXT_REG(R0), /* Zext always inserted by verifier */
+	insns[i++] = BPF_ZEXT_REG(R0); /* Zext always inserted by verifier */
 	insns[i++] = BPF_LDX_MEM(BPF_W, R3, R10, -4);
 
 	insns[i++] = BPF_JMP32_REG(BPF_JEQ, R1, R3, 2);
@@ -1754,7 +1774,7 @@ static int __bpf_emit_cmpxchg32(struct bpf_test *self, void *arg,
 	/* Result successful */
 	i += __bpf_ld_imm64(&insns[i], R0, dst);
 	insns[i++] = BPF_ATOMIC_OP(BPF_W, BPF_CMPXCHG, R10, R2, -4);
-	insns[i++] = BPF_ZEXT_REG(R0), /* Zext always inserted by verifier */
+	insns[i++] = BPF_ZEXT_REG(R0); /* Zext always inserted by verifier */
 	insns[i++] = BPF_LDX_MEM(BPF_W, R3, R10, -4);
 
 	insns[i++] = BPF_JMP32_REG(BPF_JEQ, R2, R3, 2);
@@ -5144,22 +5164,6 @@ static struct bpf_test tests[] = {
 		{ },
 		{ { 0, 0x1 } },
 	},
-	{
-		"ALU_MOVSX | BPF_W",
-		.u.insns_int = {
-			BPF_LD_IMM64(R2, 0x00000000deadbeefLL),
-			BPF_LD_IMM64(R3, 0xdeadbeefdeadbeefLL),
-			BPF_MOVSX32_REG(R1, R3, 32),
-			BPF_JMP_REG(BPF_JEQ, R2, R1, 2),
-			BPF_MOV32_IMM(R0, 2),
-			BPF_EXIT_INSN(),
-			BPF_MOV32_IMM(R0, 1),
-			BPF_EXIT_INSN(),
-		},
-		INTERNAL,
-		{ },
-		{ { 0, 0x1 } },
-	},
 	/* MOVSX64 REG */
 	{
 		"ALU64_MOVSX | BPF_B",
@@ -6293,7 +6297,7 @@ static struct bpf_test tests[] = {
 	},
 	/* BPF_ALU64 | BPF_MOD | BPF_K off=1 (SMOD64) */
 	{
-		"ALU64_SMOD_X: -7 % 2 = -1",
+		"ALU64_SMOD_K: -7 % 2 = -1",
 		.u.insns_int = {
 			BPF_LD_IMM64(R0, -7),
 			BPF_ALU64_IMM_OFF(BPF_MOD, R0, 2, 1),
@@ -12215,7 +12219,6 @@ static struct bpf_test tests[] = {
 	BPF_JMP32_IMM_ZEXT(JLE),
 	BPF_JMP32_IMM_ZEXT(JSGT),
 	BPF_JMP32_IMM_ZEXT(JSGE),
-	BPF_JMP32_IMM_ZEXT(JSGT),
 	BPF_JMP32_IMM_ZEXT(JSLT),
 	BPF_JMP32_IMM_ZEXT(JSLE),
 #undef BPF_JMP2_IMM_ZEXT
@@ -12251,7 +12254,6 @@ static struct bpf_test tests[] = {
 	BPF_JMP32_REG_ZEXT(JLE),
 	BPF_JMP32_REG_ZEXT(JSGT),
 	BPF_JMP32_REG_ZEXT(JSGE),
-	BPF_JMP32_REG_ZEXT(JSGT),
 	BPF_JMP32_REG_ZEXT(JSLT),
 	BPF_JMP32_REG_ZEXT(JSLE),
 #undef BPF_JMP2_REG_ZEXT
@@ -13449,7 +13451,7 @@ static struct bpf_test tests[] = {
 		.stack_depth = 8,
 		.nr_testruns = NR_PATTERN_RUNS,
 	},
-	/* 64-bit atomic magnitudes */
+	/* 32-bit atomic magnitudes */
 	{
 		"ATOMIC_W_ADD: all operand magnitudes",
 		{ },
@@ -14251,6 +14253,38 @@ static struct bpf_test tests[] = {
 		{ { 0, 0 } },
 	},
 	/* Conditional branch conversions */
+	{
+		"Long conditional jump: taken at runtime (32 bits)",
+		{ },
+		INTERNAL | FLAG_NO_DATA,
+		{ },
+		{ { 0, 1 } },
+		.fill_helper = bpf_fill_max_jmp_taken_32,
+	},
+	{
+		"Long conditional jump: not taken at runtime (32 bits)",
+		{ },
+		INTERNAL | FLAG_NO_DATA,
+		{ },
+		{ { 0, 2 } },
+		.fill_helper = bpf_fill_max_jmp_not_taken_32,
+	},
+	{
+		"Long conditional jump: always taken, known at JIT time (32 bits)",
+		{ },
+		INTERNAL | FLAG_NO_DATA,
+		{ },
+		{ { 0, 1 } },
+		.fill_helper = bpf_fill_max_jmp_always_taken_32,
+	},
+	{
+		"Long conditional jump: never taken, known at JIT time (32 bits)",
+		{ },
+		INTERNAL | FLAG_NO_DATA,
+		{ },
+		{ { 0, 2 } },
+		.fill_helper = bpf_fill_max_jmp_never_taken_32,
+	},
 	{
 		"Long conditional jump: taken at runtime",
 		{ },
@@ -15095,8 +15129,7 @@ static struct skb_segment_test skb_segment_tests[] __initconst = {
 		.build_skb = build_test_skb_linear_no_head_frag,
 		.features = NETIF_F_SG | NETIF_F_FRAGLIST |
 			    NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_GSO |
-			    NETIF_F_LLTX | NETIF_F_GRO |
-			    NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM |
+			    NETIF_F_GRO | NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM |
 			    NETIF_F_HW_VLAN_STAG_TX
 	}
 };
@@ -15216,6 +15249,7 @@ struct tail_call_test {
 	int flags;
 	int result;
 	int stack_depth;
+	bool has_tail_call;
 };
 
 /* Flags that can be passed to tail call test cases */
@@ -15291,6 +15325,7 @@ static struct tail_call_test tail_call_tests[] = {
 			BPF_EXIT_INSN(),
 		},
 		.result = 3,
+		.has_tail_call = true,
 	},
 	{
 		"Tail call 3",
@@ -15301,6 +15336,7 @@ static struct tail_call_test tail_call_tests[] = {
 			BPF_EXIT_INSN(),
 		},
 		.result = 6,
+		.has_tail_call = true,
 	},
 	{
 		"Tail call 4",
@@ -15311,6 +15347,7 @@ static struct tail_call_test tail_call_tests[] = {
 			BPF_EXIT_INSN(),
 		},
 		.result = 10,
+		.has_tail_call = true,
 	},
 	{
 		"Tail call load/store leaf",
@@ -15341,6 +15378,7 @@ static struct tail_call_test tail_call_tests[] = {
 		},
 		.result = 0,
 		.stack_depth = 16,
+		.has_tail_call = true,
 	},
 	{
 		"Tail call error path, max count reached",
@@ -15353,6 +15391,7 @@ static struct tail_call_test tail_call_tests[] = {
 		},
 		.flags = FLAG_NEED_STATE | FLAG_RESULT_IN_STATE,
 		.result = (MAX_TAIL_CALL_CNT + 1) * MAX_TESTRUNS,
+		.has_tail_call = true,
 	},
 	{
 		"Tail call count preserved across function calls",
@@ -15375,6 +15414,7 @@ static struct tail_call_test tail_call_tests[] = {
 		.stack_depth = 8,
 		.flags = FLAG_NEED_STATE | FLAG_RESULT_IN_STATE,
 		.result = (MAX_TAIL_CALL_CNT + 1) * MAX_TESTRUNS,
+		.has_tail_call = true,
 	},
 	{
 		"Tail call error path, NULL target",
@@ -15387,6 +15427,7 @@ static struct tail_call_test tail_call_tests[] = {
 		},
 		.flags = FLAG_NEED_STATE | FLAG_RESULT_IN_STATE,
 		.result = MAX_TESTRUNS,
+		.has_tail_call = true,
 	},
 	{
 		"Tail call error path, index out of range",
@@ -15399,6 +15440,7 @@ static struct tail_call_test tail_call_tests[] = {
 		},
 		.flags = FLAG_NEED_STATE | FLAG_RESULT_IN_STATE,
 		.result = MAX_TESTRUNS,
+		.has_tail_call = true,
 	},
 };
 
@@ -15448,6 +15490,7 @@ static __init int prepare_tail_call_tests(struct bpf_array **pprogs)
 		fp->len = len;
 		fp->type = BPF_PROG_TYPE_SOCKET_FILTER;
 		fp->aux->stack_depth = test->stack_depth;
+		fp->aux->tail_call_reachable = test->has_tail_call;
 		memcpy(fp->insnsi, test->insns, len * sizeof(struct bpf_insn));
 
 		/* Relocate runtime tail call offsets and addresses */
@@ -15724,4 +15767,5 @@ static void __exit test_bpf_exit(void)
 module_init(test_bpf_init);
 module_exit(test_bpf_exit);
 
+MODULE_DESCRIPTION("Testsuite for BPF interpreter and BPF JIT compiler");
 MODULE_LICENSE("GPL");

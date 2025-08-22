@@ -7,7 +7,7 @@
 :譯者:
 
  吳想成 Wu XiangCheng <bobwxc@email.cn>
- 胡皓文 Hu Haowen <src.res.211@gmail.com>
+ 胡皓文 Hu Haowen <2023002089@link.tyut.edu.cn>
 
 追蹤缺陷
 =========
@@ -191,7 +191,7 @@ objdump
 編行。如果沒有調試符號，您將看到所示例程的彙編程序代碼，但是如果內核有調試
 符號，C代碼也將可見（調試符號可以在內核配置菜單的hacking項中啓用）。例如::
 
-    $ objdump -r -S -l --disassemble net/dccp/ipv4.o
+    $ objdump -r -S -l --disassemble net/ipv4/tcp.o
 
 .. note::
 
@@ -331,14 +331,4 @@ sysklogd發行版附帶了一個補丁，它修改了 ``modules-2.0.0`` 包，�
 	Aug 29 09:51:01 blizard kernel:        bffffdb3 bffffed4 ffffffda 0000002b 0007002b 0000002b 0000002b 00000036
 	Aug 29 09:51:01 blizard kernel: Call Trace: [oops:_oops_ioctl+48/80] [_sys_ioctl+254/272] [_system_call+82/128]
 	Aug 29 09:51:01 blizard kernel: Code: c7 00 05 00 00 00 eb 08 90 90 90 90 90 90 90 90 89 ec 5d c3
-
----------------------------------------------------------------------------
-
-::
-
-  Dr. G.W. Wettstein           Oncology Research Div. Computing Facility
-  Roger Maris Cancer Center    INTERNET: greg@wind.rmcc.com
-  820 4th St. N.
-  Fargo, ND  58122
-  Phone: 701-234-7556
 

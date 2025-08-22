@@ -101,6 +101,7 @@ void rt2x00lib_disable_radio(struct rt2x00_dev *rt2x00dev)
 	rt2x00link_stop_tuner(rt2x00dev);
 	rt2x00queue_stop_queues(rt2x00dev);
 	rt2x00queue_flush_queues(rt2x00dev, true);
+	rt2x00queue_stop_queue(rt2x00dev->bcn);
 
 	/*
 	 * Disable radio.
@@ -356,7 +357,7 @@ static void rt2x00lib_fill_tx_status(struct rt2x00_dev *rt2x00dev,
 	}
 
 	/*
-	 * Every single frame has it's own tx status, hence report
+	 * Every single frame has its own tx status, hence report
 	 * every frame as ampdu of size 1.
 	 *
 	 * TODO: if we can find out how many frames were aggregated
@@ -495,7 +496,7 @@ void rt2x00lib_txdone(struct queue_entry *entry,
 	/*
 	 * If the IV/EIV data was stripped from the frame before it was
 	 * passed to the hardware, we should now reinsert it again because
-	 * mac80211 will expect the same data to be present it the
+	 * mac80211 will expect the same data to be present in the
 	 * frame as it was passed to us.
 	 */
 	if (rt2x00_has_cap_hw_crypto(rt2x00dev))
@@ -1286,6 +1287,7 @@ int rt2x00lib_start(struct rt2x00_dev *rt2x00dev)
 	rt2x00dev->intf_ap_count = 0;
 	rt2x00dev->intf_sta_count = 0;
 	rt2x00dev->intf_associated = 0;
+	rt2x00dev->intf_beaconing = 0;
 
 	/* Enable the radio */
 	retval = rt2x00lib_enable_radio(rt2x00dev);
@@ -1312,6 +1314,7 @@ void rt2x00lib_stop(struct rt2x00_dev *rt2x00dev)
 	rt2x00dev->intf_ap_count = 0;
 	rt2x00dev->intf_sta_count = 0;
 	rt2x00dev->intf_associated = 0;
+	rt2x00dev->intf_beaconing = 0;
 }
 
 static inline void rt2x00lib_set_if_combinations(struct rt2x00_dev *rt2x00dev)
@@ -1388,8 +1391,8 @@ int rt2x00lib_probe_dev(struct rt2x00_dev *rt2x00dev)
 	mutex_init(&rt2x00dev->conf_mutex);
 	INIT_LIST_HEAD(&rt2x00dev->bar_list);
 	spin_lock_init(&rt2x00dev->bar_list_lock);
-	hrtimer_init(&rt2x00dev->txstatus_timer, CLOCK_MONOTONIC,
-		     HRTIMER_MODE_REL);
+	hrtimer_setup(&rt2x00dev->txstatus_timer, hrtimer_dummy_timeout, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
 
 	set_bit(DEVICE_STATE_PRESENT, &rt2x00dev->flags);
 

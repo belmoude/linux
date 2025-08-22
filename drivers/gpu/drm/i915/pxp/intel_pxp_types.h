@@ -21,7 +21,7 @@ struct drm_i915_private;
  */
 struct intel_pxp {
 	/**
-	 * @ctrl_gt: poiner to the tile that owns the controls for PXP subsystem assets that
+	 * @ctrl_gt: pointer to the tile that owns the controls for PXP subsystem assets that
 	 * the VDBOX, the KCR engine (and GSC CS depending on the platform)
 	 */
 	struct intel_gt *ctrl_gt;
@@ -124,6 +124,7 @@ struct intel_pxp {
 #define PXP_TERMINATION_REQUEST  BIT(0)
 #define PXP_TERMINATION_COMPLETE BIT(1)
 #define PXP_INVAL_REQUIRED       BIT(2)
+#define PXP_EVENT_TYPE_IRQ       BIT(3)
 };
 
 #endif /* __INTEL_PXP_TYPES_H__ */

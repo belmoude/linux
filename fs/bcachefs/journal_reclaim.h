@@ -16,6 +16,7 @@ static inline void journal_reclaim_kick(struct journal *j)
 unsigned bch2_journal_dev_buckets_available(struct journal *,
 					    struct journal_device *,
 					    enum journal_space_from);
+void bch2_journal_set_watermark(struct journal *);
 void bch2_journal_space_available(struct journal *);
 
 static inline bool journal_pin_active(struct journal_entry_pin *pin)
@@ -47,17 +48,10 @@ static inline void bch2_journal_pin_add(struct journal *j, u64 seq,
 		bch2_journal_pin_set(j, seq, pin, flush_fn);
 }
 
-static inline void bch2_journal_pin_copy(struct journal *j,
-					 struct journal_entry_pin *dst,
-					 struct journal_entry_pin *src,
-					 journal_pin_flush_fn flush_fn)
-{
-	/* Guard against racing with journal_pin_drop(src): */
-	u64 seq = READ_ONCE(src->seq);
-
-	if (seq)
-		bch2_journal_pin_add(j, seq, dst, flush_fn);
-}
+void bch2_journal_pin_copy(struct journal *,
+			   struct journal_entry_pin *,
+			   struct journal_entry_pin *,
+			   journal_pin_flush_fn);
 
 static inline void bch2_journal_pin_update(struct journal *j, u64 seq,
 					   struct journal_entry_pin *pin,
@@ -83,5 +77,8 @@ static inline bool bch2_journal_flush_all_pins(struct journal *j)
 }
 
 int bch2_journal_flush_device_pins(struct journal *, int);
+
+void bch2_journal_pins_to_text(struct printbuf *, struct journal *);
+bool bch2_journal_seq_pins_to_text(struct printbuf *, struct journal *, u64 *);
 
 #endif /* _BCACHEFS_JOURNAL_RECLAIM_H */

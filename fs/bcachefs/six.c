@@ -169,11 +169,17 @@ static int __do_six_trylock(struct six_lock *lock, enum six_lock_type type,
 				ret = -1 - SIX_LOCK_write;
 		}
 	} else if (type == SIX_LOCK_write && lock->readers) {
-		if (try) {
+		if (try)
 			atomic_add(SIX_LOCK_HELD_write, &lock->state);
-			smp_mb__after_atomic();
-		}
 
+		/*
+		 * Make sure atomic_add happens before pcpu_read_count and
+		 * six_set_bitmask in slow path happens before pcpu_read_count.
+		 *
+		 * Paired with the smp_mb() in read lock fast path (per-cpu mode)
+		 * and the one before atomic_read in read unlock path.
+		 */
+		smp_mb();
 		ret = !pcpu_read_count(lock);
 
 		if (try && !ret) {
@@ -324,101 +330,54 @@ bool six_relock_ip(struct six_lock *lock, enum six_lock_type type,
 }
 EXPORT_SYMBOL_GPL(six_relock_ip);
 
-#ifdef CONFIG_SIX_LOCK_SPIN_ON_OWNER
+#ifdef CONFIG_BCACHEFS_SIX_OPTIMISTIC_SPIN
 
-static inline bool six_can_spin_on_owner(struct six_lock *lock)
+static inline bool six_owner_running(struct six_lock *lock)
 {
-	struct task_struct *owner;
-	bool ret;
-
-	if (need_resched())
-		return false;
-
-	rcu_read_lock();
-	owner = READ_ONCE(lock->owner);
-	ret = !owner || owner_on_cpu(owner);
-	rcu_read_unlock();
-
-	return ret;
+	/*
+	 * When there's no owner, we might have preempted between the owner
+	 * acquiring the lock and setting the owner field. If we're an RT task
+	 * that will live-lock because we won't let the owner complete.
+	 */
+	guard(rcu)();
+	struct task_struct *owner = READ_ONCE(lock->owner);
+	return owner ? owner_on_cpu(owner) : !rt_or_dl_task(current);
 }
 
-static inline bool six_spin_on_owner(struct six_lock *lock,
-				     struct task_struct *owner,
-				     u64 end_time)
+static inline bool six_optimistic_spin(struct six_lock *lock,
+				       struct six_lock_waiter *wait,
+				       enum six_lock_type type)
 {
-	bool ret = true;
 	unsigned loop = 0;
-
-	rcu_read_lock();
-	while (lock->owner == owner) {
-		/*
-		 * Ensure we emit the owner->on_cpu, dereference _after_
-		 * checking lock->owner still matches owner. If that fails,
-		 * owner might point to freed memory. If it still matches,
-		 * the rcu_read_lock() ensures the memory stays valid.
-		 */
-		barrier();
-
-		if (!owner_on_cpu(owner) || need_resched()) {
-			ret = false;
-			break;
-		}
-
-		if (!(++loop & 0xf) && (time_after64(sched_clock(), end_time))) {
-			six_set_bitmask(lock, SIX_LOCK_NOSPIN);
-			ret = false;
-			break;
-		}
-
-		cpu_relax();
-	}
-	rcu_read_unlock();
-
-	return ret;
-}
-
-static inline bool six_optimistic_spin(struct six_lock *lock, enum six_lock_type type)
-{
-	struct task_struct *task = current;
 	u64 end_time;
 
 	if (type == SIX_LOCK_write)
 		return false;
 
+	if (lock->wait_list.next != &wait->list)
+		return false;
+
+	if (atomic_read(&lock->state) & SIX_LOCK_NOSPIN)
+		return false;
+
 	preempt_disable();
-	if (!six_can_spin_on_owner(lock))
-		goto fail;
-
-	if (!osq_lock(&lock->osq))
-		goto fail;
-
 	end_time = sched_clock() + 10 * NSEC_PER_USEC;
 
-	while (1) {
-		struct task_struct *owner;
-
+	while (!need_resched() && six_owner_running(lock)) {
 		/*
-		 * If there's an owner, wait for it to either
-		 * release the lock or go to sleep.
+		 * Ensures that writes to the waitlist entry happen after we see
+		 * wait->lock_acquired: pairs with the smp_store_release in
+		 * __six_lock_wakeup
 		 */
-		owner = READ_ONCE(lock->owner);
-		if (owner && !six_spin_on_owner(lock, owner, end_time))
-			break;
-
-		if (do_six_trylock(lock, type, false)) {
-			osq_unlock(&lock->osq);
+		if (smp_load_acquire(&wait->lock_acquired)) {
 			preempt_enable();
 			return true;
 		}
 
-		/*
-		 * When there's no owner, we might have preempted between the
-		 * owner acquiring the lock and setting the owner field. If
-		 * we're an RT task that will live-lock because we won't let
-		 * the owner complete.
-		 */
-		if (!owner && (need_resched() || rt_task(task)))
+		if (!(++loop & 0xf) && (time_after64(sched_clock(), end_time))) {
+			six_set_bitmask(lock, SIX_LOCK_NOSPIN);
 			break;
+		}
 
 		/*
 		 * The cpu_relax() call is a compiler barrier which forces
@@ -429,24 +388,15 @@ static inline bool six_optimistic_spin(struct six_lock *lock, enum six_lock_type
 		cpu_relax();
 	}
 
-	osq_unlock(&lock->osq);
-fail:
 	preempt_enable();
-
-	/*
-	 * If we fell out of the spin path because of need_resched(),
-	 * reschedule now, before we try-lock again. This avoids getting
-	 * scheduled out right after we obtained the lock.
-	 */
-	if (need_resched())
-		schedule();
-
 	return false;
 }
 
-#else /* CONFIG_SIX_LOCK_SPIN_ON_OWNER */
+#else /* CONFIG_LOCK_SPIN_ON_OWNER */
 
-static inline bool six_optimistic_spin(struct six_lock *lock, enum six_lock_type type)
+static inline bool six_optimistic_spin(struct six_lock *lock,
+				       struct six_lock_waiter *wait,
+				       enum six_lock_type type)
 {
 	return false;
 }
@@ -469,9 +419,6 @@ static int six_lock_slowpath(struct six_lock *lock, enum six_lock_type type,
 
 	trace_contention_begin(lock, 0);
 	lock_contended(&lock->dep_map, ip);
-
-	if (six_optimistic_spin(lock, type))
-		goto out;
 
 	wait->task		= current;
 	wait->lock_want		= type;
@@ -510,6 +457,9 @@ static int six_lock_slowpath(struct six_lock *lock, enum six_lock_type type,
 		ret = 0;
 	}
 
+	if (six_optimistic_spin(lock, wait, type))
+		goto out;
+
 	while (1) {
 		set_current_state(TASK_UNINTERRUPTIBLE);
 
@@ -538,8 +488,12 @@ static int six_lock_slowpath(struct six_lock *lock, enum six_lock_type type,
 				list_del(&wait->list);
 			raw_spin_unlock(&lock->wait_lock);
 
-			if (unlikely(acquired))
+			if (unlikely(acquired)) {
 				do_six_unlock_type(lock, type);
+			} else if (type == SIX_LOCK_write) {
+				six_clear_bitmask(lock, SIX_LOCK_HELD_write);
+				six_lock_wakeup(lock, atomic_read(&lock->state), SIX_LOCK_read);
+			}
 			break;
 		}
 
@@ -548,10 +502,6 @@ static int six_lock_slowpath(struct six_lock *lock, enum six_lock_type type,
 
 	__set_current_state(TASK_RUNNING);
 out:
-	if (ret && type == SIX_LOCK_write) {
-		six_clear_bitmask(lock, SIX_LOCK_HELD_write);
-		six_lock_wakeup(lock, atomic_read(&lock->state), SIX_LOCK_read);
-	}
 	trace_contention_end(lock, 0);
 
 	return ret;
@@ -663,14 +613,21 @@ void six_unlock_ip(struct six_lock *lock, enum six_lock_type type, unsigned long
 
 	if (type != SIX_LOCK_write)
 		six_release(&lock->dep_map, ip);
-	else
-		lock->seq++;
 
 	if (type == SIX_LOCK_intent &&
 	    lock->intent_lock_recurse) {
 		--lock->intent_lock_recurse;
 		return;
 	}
+
+	if (type == SIX_LOCK_write &&
+	    lock->write_lock_recurse) {
+		--lock->write_lock_recurse;
+		return;
+	}
+
+	if (type == SIX_LOCK_write)
+		lock->seq++;
 
 	do_six_unlock_type(lock, type);
 }
@@ -782,12 +739,12 @@ void six_lock_increment(struct six_lock *lock, enum six_lock_type type)
 			atomic_add(l[type].lock_val, &lock->state);
 		}
 		break;
+	case SIX_LOCK_write:
+		lock->write_lock_recurse++;
+		fallthrough;
 	case SIX_LOCK_intent:
 		EBUG_ON(!(atomic_read(&lock->state) & SIX_LOCK_HELD_intent));
 		lock->intent_lock_recurse++;
-		break;
-	case SIX_LOCK_write:
-		BUG();
 		break;
 	}
 }
@@ -890,7 +847,8 @@ void six_lock_exit(struct six_lock *lock)
 EXPORT_SYMBOL_GPL(six_lock_exit);
 
 void __six_lock_init(struct six_lock *lock, const char *name,
-		     struct lock_class_key *key, enum six_lock_init_flags flags)
+		     struct lock_class_key *key, enum six_lock_init_flags flags,
+		     gfp_t gfp)
 {
 	atomic_set(&lock->state, 0);
 	raw_spin_lock_init(&lock->wait_lock);
@@ -913,7 +871,7 @@ void __six_lock_init(struct six_lock *lock, const char *name,
 		 * failure if they wish by checking lock->readers, but generally
 		 * will not want to treat it as an error.
 		 */
-		lock->readers = alloc_percpu(unsigned);
+		lock->readers = alloc_percpu_gfp(unsigned, gfp);
 	}
 #endif
 }

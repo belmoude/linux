@@ -24,6 +24,8 @@ struct tcf_walker {
 
 int register_tcf_proto_ops(struct tcf_proto_ops *ops);
 void unregister_tcf_proto_ops(struct tcf_proto_ops *ops);
+#define NET_CLS_ALIAS_PREFIX "net-cls-"
+#define MODULE_ALIAS_NET_CLS(kind)	MODULE_ALIAS(NET_CLS_ALIAS_PREFIX kind)
 
 struct tcf_block_ext_info {
 	enum flow_block_binder_type binder_type;
@@ -71,6 +73,15 @@ static inline bool tcf_block_non_null_shared(struct tcf_block *block)
 {
 	return block && block->index;
 }
+
+#ifdef CONFIG_NET_CLS_ACT
+DECLARE_STATIC_KEY_FALSE(tcf_sw_enabled_key);
+
+static inline bool tcf_block_bypass_sw(struct tcf_block *block)
+{
+	return block && !atomic_read(&block->useswcnt);
+}
+#endif
 
 static inline struct Qdisc *tcf_block_q(struct tcf_block *block)
 {
@@ -152,12 +163,6 @@ static inline unsigned long
 __cls_set_class(unsigned long *clp, unsigned long cl)
 {
 	return xchg(clp, cl);
-}
-
-static inline void tcf_set_drop_reason(struct tcf_result *res,
-				       enum skb_drop_reason reason)
-{
-	res->drop_reason = reason;
 }
 
 static inline void
@@ -314,7 +319,7 @@ tcf_exts_hw_stats_update(const struct tcf_exts *exts,
  * tcf_exts_has_actions - check if at least one action is present
  * @exts: tc filter extensions handle
  *
- * Returns true if at least one action is present.
+ * Returns: true if at least one action is present.
  */
 static inline bool tcf_exts_has_actions(struct tcf_exts *exts)
 {
@@ -486,7 +491,7 @@ int __tcf_em_tree_match(struct sk_buff *, struct tcf_ematch_tree *,
 			struct tcf_pkt_info *);
 
 /**
- * tcf_em_tree_match - evaulate an ematch tree
+ * tcf_em_tree_match - evaluate an ematch tree
  *
  * @skb: socket buffer of the packet in question
  * @tree: ematch tree to be used for evaluation
@@ -496,7 +501,7 @@ int __tcf_em_tree_match(struct sk_buff *, struct tcf_ematch_tree *,
  * through all ematches respecting their logic relations returning
  * as soon as the result is obvious.
  *
- * Returns 1 if the ematch tree as-one matches, no ematches are configured
+ * Returns: 1 if the ematch tree as-one matches, no ematches are configured
  * or ematch is not enabled in the kernel, otherwise 0 is returned.
  */
 static inline int tcf_em_tree_match(struct sk_buff *skb,
@@ -750,8 +755,18 @@ tc_cls_common_offload_init(struct flow_cls_common_offload *cls_common,
 	cls_common->chain_index = tp->chain->index;
 	cls_common->protocol = tp->protocol;
 	cls_common->prio = tp->prio >> 16;
+	cls_common->skip_sw = tc_skip_sw(flags);
 	if (tc_skip_sw(flags) || flags & TCA_CLS_FLAGS_VERBOSE)
 		cls_common->extack = extack;
+}
+
+static inline void tcf_proto_update_usesw(struct tcf_proto *tp, u32 flags)
+{
+	if (tp->usesw)
+		return;
+	if (tc_skip_sw(flags) && tc_in_hw(flags))
+		return;
+	tp->usesw = true;
 }
 
 #if IS_ENABLED(CONFIG_NET_TC_SKB_EXT)

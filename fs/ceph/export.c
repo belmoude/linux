@@ -3,7 +3,7 @@
 
 #include <linux/exportfs.h>
 #include <linux/slab.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #include "super.h"
 #include "mds_client.h"
@@ -33,12 +33,19 @@ struct ceph_nfs_snapfh {
 	u32 hash;
 } __attribute__ ((packed));
 
+#define BYTES_PER_U32		(sizeof(u32))
+#define CEPH_FH_BASIC_SIZE \
+	(sizeof(struct ceph_nfs_fh) / BYTES_PER_U32)
+#define CEPH_FH_WITH_PARENT_SIZE \
+	(sizeof(struct ceph_nfs_confh) / BYTES_PER_U32)
+#define CEPH_FH_SNAPPED_INODE_SIZE \
+	(sizeof(struct ceph_nfs_snapfh) / BYTES_PER_U32)
+
 static int ceph_encode_snapfh(struct inode *inode, u32 *rawfh, int *max_len,
 			      struct inode *parent_inode)
 {
 	struct ceph_client *cl = ceph_inode_to_client(inode);
-	static const int snap_handle_length =
-		sizeof(struct ceph_nfs_snapfh) >> 2;
+	static const int snap_handle_length = CEPH_FH_SNAPPED_INODE_SIZE;
 	struct ceph_nfs_snapfh *sfh = (void *)rawfh;
 	u64 snapid = ceph_snap(inode);
 	int ret;
@@ -88,10 +95,8 @@ static int ceph_encode_fh(struct inode *inode, u32 *rawfh, int *max_len,
 			  struct inode *parent_inode)
 {
 	struct ceph_client *cl = ceph_inode_to_client(inode);
-	static const int handle_length =
-		sizeof(struct ceph_nfs_fh) >> 2;
-	static const int connected_handle_length =
-		sizeof(struct ceph_nfs_confh) >> 2;
+	static const int handle_length = CEPH_FH_BASIC_SIZE;
+	static const int connected_handle_length = CEPH_FH_WITH_PARENT_SIZE;
 	int type;
 
 	if (ceph_snap(inode) != CEPH_NOSNAP)
@@ -286,8 +291,6 @@ static struct dentry *__snapfh_to_dentry(struct super_block *sb,
 		doutc(cl, "%llx.%llx parent %llx hash %x err=%d", vino.ino,
 		      vino.snap, sfh->parent_ino, sfh->hash, err);
 	}
-	if (IS_ERR(inode))
-		return ERR_CAST(inode);
 	/* see comments in ceph_get_parent() */
 	return unlinked ? d_obtain_root(inode) : d_obtain_alias(inode);
 }
@@ -310,7 +313,7 @@ static struct dentry *ceph_fh_to_dentry(struct super_block *sb,
 	if (fh_type != FILEID_INO32_GEN  &&
 	    fh_type != FILEID_INO32_GEN_PARENT)
 		return NULL;
-	if (fh_len < sizeof(*fh) / 4)
+	if (fh_len < sizeof(*fh) / BYTES_PER_U32)
 		return NULL;
 
 	doutc(fsc->client, "%llx\n", fh->ino);
@@ -395,9 +398,9 @@ static struct dentry *ceph_get_parent(struct dentry *child)
 			}
 			dir = snapdir;
 		}
-		/* If directory has already been deleted, futher get_parent
+		/* If directory has already been deleted, further get_parent
 		 * will fail. Do not mark snapdir dentry as disconnected,
-		 * this prevent exportfs from doing futher get_parent. */
+		 * this prevents exportfs from doing further get_parent. */
 		if (unlinked)
 			dn = d_obtain_root(dir);
 		else
@@ -429,7 +432,7 @@ static struct dentry *ceph_fh_to_parent(struct super_block *sb,
 
 	if (fh_type != FILEID_INO32_GEN_PARENT)
 		return NULL;
-	if (fh_len < sizeof(*cfh) / 4)
+	if (fh_len < sizeof(*cfh) / BYTES_PER_U32)
 		return NULL;
 
 	doutc(fsc->client, "%llx\n", cfh->parent_ino);
@@ -454,7 +457,13 @@ static int __get_snap_name(struct dentry *parent, char *name,
 		goto out;
 	if (ceph_snap(inode) == CEPH_SNAPDIR) {
 		if (ceph_snap(dir) == CEPH_NOSNAP) {
-			strcpy(name, fsc->mount_options->snapdir_name);
+			/*
+			 * .get_name() from struct export_operations
+			 * assumes that its 'name' parameter is pointing
+			 * to a NAME_MAX+1 sized buffer
+			 */
+			strscpy(name, fsc->mount_options->snapdir_name,
+				NAME_MAX + 1);
 			err = 0;
 		}
 		goto out;

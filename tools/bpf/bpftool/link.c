@@ -107,7 +107,7 @@ static int link_parse_fd(int *argc, char ***argv)
 
 		fd = bpf_link_get_fd_by_id(id);
 		if (fd < 0)
-			p_err("failed to get link with ID %d: %s", id, strerror(errno));
+			p_err("failed to get link with ID %u: %s", id, strerror(errno));
 		return fd;
 	} else if (is_prefix(**argv, "pinned")) {
 		char *path;
@@ -117,7 +117,7 @@ static int link_parse_fd(int *argc, char ***argv)
 		path = **argv;
 		NEXT_ARGP();
 
-		return open_obj_pinned_any(path, BPF_OBJ_LINK);
+		return open_obj_pinned_any(path, BPF_OBJ_LINK, NULL);
 	}
 
 	p_err("expected 'id' or 'pinned', got: '%s'?", **argv);
@@ -249,18 +249,44 @@ static int get_prog_info(int prog_id, struct bpf_prog_info *info)
 	return err;
 }
 
-static int cmp_u64(const void *A, const void *B)
-{
-	const __u64 *a = A, *b = B;
+struct addr_cookie {
+	__u64 addr;
+	__u64 cookie;
+};
 
-	return *a - *b;
+static int cmp_addr_cookie(const void *A, const void *B)
+{
+	const struct addr_cookie *a = A, *b = B;
+
+	if (a->addr == b->addr)
+		return 0;
+	return a->addr < b->addr ? -1 : 1;
+}
+
+static struct addr_cookie *
+get_addr_cookie_array(__u64 *addrs, __u64 *cookies, __u32 count)
+{
+	struct addr_cookie *data;
+	__u32 i;
+
+	data = calloc(count, sizeof(data[0]));
+	if (!data) {
+		p_err("mem alloc failed");
+		return NULL;
+	}
+	for (i = 0; i < count; i++) {
+		data[i].addr = addrs[i];
+		data[i].cookie = cookies[i];
+	}
+	qsort(data, count, sizeof(data[0]), cmp_addr_cookie);
+	return data;
 }
 
 static void
 show_kprobe_multi_json(struct bpf_link_info *info, json_writer_t *wtr)
 {
+	struct addr_cookie *data;
 	__u32 i, j = 0;
-	__u64 *addrs;
 
 	jsonw_bool_field(json_wtr, "retprobe",
 			 info->kprobe_multi.flags & BPF_F_KPROBE_MULTI_RETURN);
@@ -268,14 +294,20 @@ show_kprobe_multi_json(struct bpf_link_info *info, json_writer_t *wtr)
 	jsonw_uint_field(json_wtr, "missed", info->kprobe_multi.missed);
 	jsonw_name(json_wtr, "funcs");
 	jsonw_start_array(json_wtr);
-	addrs = u64_to_ptr(info->kprobe_multi.addrs);
-	qsort(addrs, info->kprobe_multi.count, sizeof(addrs[0]), cmp_u64);
+	data = get_addr_cookie_array(u64_to_ptr(info->kprobe_multi.addrs),
+				     u64_to_ptr(info->kprobe_multi.cookies),
+				     info->kprobe_multi.count);
+	if (!data)
+		return;
 
 	/* Load it once for all. */
 	if (!dd.sym_count)
 		kernel_syms_load(&dd);
+	if (!dd.sym_count)
+		goto error;
+
 	for (i = 0; i < dd.sym_count; i++) {
-		if (dd.sym_mapping[i].address != addrs[j])
+		if (dd.sym_mapping[i].address != data[j].addr)
 			continue;
 		jsonw_start_object(json_wtr);
 		jsonw_uint_field(json_wtr, "addr", dd.sym_mapping[i].address);
@@ -287,9 +319,43 @@ show_kprobe_multi_json(struct bpf_link_info *info, json_writer_t *wtr)
 		} else {
 			jsonw_string_field(json_wtr, "module", dd.sym_mapping[i].module);
 		}
+		jsonw_uint_field(json_wtr, "cookie", data[j].cookie);
 		jsonw_end_object(json_wtr);
 		if (j++ == info->kprobe_multi.count)
 			break;
+	}
+	jsonw_end_array(json_wtr);
+error:
+	free(data);
+}
+
+static __u64 *u64_to_arr(__u64 val)
+{
+	return (__u64 *) u64_to_ptr(val);
+}
+
+static void
+show_uprobe_multi_json(struct bpf_link_info *info, json_writer_t *wtr)
+{
+	__u32 i;
+
+	jsonw_bool_field(json_wtr, "retprobe",
+			 info->uprobe_multi.flags & BPF_F_UPROBE_MULTI_RETURN);
+	jsonw_string_field(json_wtr, "path", (char *) u64_to_ptr(info->uprobe_multi.path));
+	jsonw_uint_field(json_wtr, "func_cnt", info->uprobe_multi.count);
+	jsonw_int_field(json_wtr, "pid", (int) info->uprobe_multi.pid);
+	jsonw_name(json_wtr, "funcs");
+	jsonw_start_array(json_wtr);
+
+	for (i = 0; i < info->uprobe_multi.count; i++) {
+		jsonw_start_object(json_wtr);
+		jsonw_uint_field(json_wtr, "offset",
+				 u64_to_arr(info->uprobe_multi.offsets)[i]);
+		jsonw_uint_field(json_wtr, "ref_ctr_offset",
+				 u64_to_arr(info->uprobe_multi.ref_ctr_offsets)[i]);
+		jsonw_uint_field(json_wtr, "cookie",
+				 u64_to_arr(info->uprobe_multi.cookies)[i]);
+		jsonw_end_object(json_wtr);
 	}
 	jsonw_end_array(json_wtr);
 }
@@ -303,6 +369,7 @@ show_perf_event_kprobe_json(struct bpf_link_info *info, json_writer_t *wtr)
 			   u64_to_ptr(info->perf_event.kprobe.func_name));
 	jsonw_uint_field(wtr, "offset", info->perf_event.kprobe.offset);
 	jsonw_uint_field(wtr, "missed", info->perf_event.kprobe.missed);
+	jsonw_uint_field(wtr, "cookie", info->perf_event.kprobe.cookie);
 }
 
 static void
@@ -312,6 +379,8 @@ show_perf_event_uprobe_json(struct bpf_link_info *info, json_writer_t *wtr)
 	jsonw_string_field(wtr, "file",
 			   u64_to_ptr(info->perf_event.uprobe.file_name));
 	jsonw_uint_field(wtr, "offset", info->perf_event.uprobe.offset);
+	jsonw_uint_field(wtr, "cookie", info->perf_event.uprobe.cookie);
+	jsonw_uint_field(wtr, "ref_ctr_offset", info->perf_event.uprobe.ref_ctr_offset);
 }
 
 static void
@@ -319,6 +388,7 @@ show_perf_event_tracepoint_json(struct bpf_link_info *info, json_writer_t *wtr)
 {
 	jsonw_string_field(wtr, "tracepoint",
 			   u64_to_ptr(info->perf_event.tracepoint.tp_name));
+	jsonw_uint_field(wtr, "cookie", info->perf_event.tracepoint.cookie);
 }
 
 static char *perf_config_hw_cache_str(__u64 config)
@@ -335,7 +405,7 @@ static char *perf_config_hw_cache_str(__u64 config)
 	if (hw_cache)
 		snprintf(str, PERF_HW_CACHE_LEN, "%s-", hw_cache);
 	else
-		snprintf(str, PERF_HW_CACHE_LEN, "%lld-", config & 0xff);
+		snprintf(str, PERF_HW_CACHE_LEN, "%llu-", config & 0xff);
 
 	op = perf_event_name(evsel__hw_cache_op, (config >> 8) & 0xff);
 	if (op)
@@ -343,7 +413,7 @@ static char *perf_config_hw_cache_str(__u64 config)
 			 "%s-", op);
 	else
 		snprintf(str + strlen(str), PERF_HW_CACHE_LEN - strlen(str),
-			 "%lld-", (config >> 8) & 0xff);
+			 "%llu-", (config >> 8) & 0xff);
 
 	result = perf_event_name(evsel__hw_cache_result, config >> 16);
 	if (result)
@@ -351,7 +421,7 @@ static char *perf_config_hw_cache_str(__u64 config)
 			 "%s", result);
 	else
 		snprintf(str + strlen(str), PERF_HW_CACHE_LEN - strlen(str),
-			 "%lld", config >> 16);
+			 "%llu", config >> 16);
 	return str;
 }
 
@@ -395,6 +465,8 @@ show_perf_event_event_json(struct bpf_link_info *info, json_writer_t *wtr)
 	else
 		jsonw_uint_field(wtr, "event_config", config);
 
+	jsonw_uint_field(wtr, "cookie", info->perf_event.event.cookie);
+
 	if (type == PERF_TYPE_HW_CACHE && perf_config)
 		free((void *)perf_config);
 }
@@ -413,6 +485,7 @@ static int show_link_close_json(int fd, struct bpf_link_info *info)
 	case BPF_LINK_TYPE_RAW_TRACEPOINT:
 		jsonw_string_field(json_wtr, "tp_name",
 				   u64_to_ptr(info->raw_tracepoint.tp_name));
+		jsonw_uint_field(json_wtr, "cookie", info->raw_tracepoint.cookie);
 		break;
 	case BPF_LINK_TYPE_TRACING:
 		err = get_prog_info(info->prog_id, &prog_info);
@@ -430,6 +503,7 @@ static int show_link_close_json(int fd, struct bpf_link_info *info)
 					   json_wtr);
 		jsonw_uint_field(json_wtr, "target_obj_id", info->tracing.target_obj_id);
 		jsonw_uint_field(json_wtr, "target_btf_id", info->tracing.target_btf_id);
+		jsonw_uint_field(json_wtr, "cookie", info->tracing.cookie);
 		break;
 	case BPF_LINK_TYPE_CGROUP:
 		jsonw_lluint_field(json_wtr, "cgroup_id",
@@ -455,6 +529,10 @@ static int show_link_close_json(int fd, struct bpf_link_info *info)
 		show_link_ifindex_json(info->netkit.ifindex, json_wtr);
 		show_link_attach_type_json(info->netkit.attach_type, json_wtr);
 		break;
+	case BPF_LINK_TYPE_SOCKMAP:
+		jsonw_uint_field(json_wtr, "map_id", info->sockmap.map_id);
+		show_link_attach_type_json(info->sockmap.attach_type, json_wtr);
+		break;
 	case BPF_LINK_TYPE_XDP:
 		show_link_ifindex_json(info->xdp.ifindex, json_wtr);
 		break;
@@ -464,6 +542,9 @@ static int show_link_close_json(int fd, struct bpf_link_info *info)
 		break;
 	case BPF_LINK_TYPE_KPROBE_MULTI:
 		show_kprobe_multi_json(info, json_wtr);
+		break;
+	case BPF_LINK_TYPE_UPROBE_MULTI:
+		show_uprobe_multi_json(info, json_wtr);
 		break;
 	case BPF_LINK_TYPE_PERF_EVENT:
 		switch (info->perf_event.type) {
@@ -545,7 +626,7 @@ static void show_link_ifindex_plain(__u32 ifindex)
 	else
 		snprintf(devname, sizeof(devname), "(detached)");
 	if (ret)
-		snprintf(devname, sizeof(devname), "%s(%d)",
+		snprintf(devname, sizeof(devname), "%s(%u)",
 			 tmpname, ifindex);
 	printf("ifindex %s  ", devname);
 }
@@ -621,7 +702,7 @@ void netfilter_dump_plain(const struct bpf_link_info *info)
 	if (pfname)
 		printf("\n\t%s", pfname);
 	else
-		printf("\n\tpf: %d", pf);
+		printf("\n\tpf: %u", pf);
 
 	if (hookname)
 		printf(" %s", hookname);
@@ -636,8 +717,8 @@ void netfilter_dump_plain(const struct bpf_link_info *info)
 
 static void show_kprobe_multi_plain(struct bpf_link_info *info)
 {
+	struct addr_cookie *data;
 	__u32 i, j = 0;
-	__u64 *addrs;
 
 	if (!info->kprobe_multi.count)
 		return;
@@ -649,21 +730,24 @@ static void show_kprobe_multi_plain(struct bpf_link_info *info)
 	printf("func_cnt %u  ", info->kprobe_multi.count);
 	if (info->kprobe_multi.missed)
 		printf("missed %llu  ", info->kprobe_multi.missed);
-	addrs = (__u64 *)u64_to_ptr(info->kprobe_multi.addrs);
-	qsort(addrs, info->kprobe_multi.count, sizeof(__u64), cmp_u64);
+	data = get_addr_cookie_array(u64_to_ptr(info->kprobe_multi.addrs),
+				     u64_to_ptr(info->kprobe_multi.cookies),
+				     info->kprobe_multi.count);
+	if (!data)
+		return;
 
 	/* Load it once for all. */
 	if (!dd.sym_count)
 		kernel_syms_load(&dd);
 	if (!dd.sym_count)
-		return;
+		goto error;
 
-	printf("\n\t%-16s %s", "addr", "func [module]");
+	printf("\n\t%-16s %-16s %s", "addr", "cookie", "func [module]");
 	for (i = 0; i < dd.sym_count; i++) {
-		if (dd.sym_mapping[i].address != addrs[j])
+		if (dd.sym_mapping[i].address != data[j].addr)
 			continue;
-		printf("\n\t%016lx %s",
-		       dd.sym_mapping[i].address, dd.sym_mapping[i].name);
+		printf("\n\t%016lx %-16llx %s",
+		       dd.sym_mapping[i].address, data[j].cookie, dd.sym_mapping[i].name);
 		if (dd.sym_mapping[i].module[0] != '\0')
 			printf(" [%s]  ", dd.sym_mapping[i].module);
 		else
@@ -671,6 +755,35 @@ static void show_kprobe_multi_plain(struct bpf_link_info *info)
 
 		if (j++ == info->kprobe_multi.count)
 			break;
+	}
+error:
+	free(data);
+}
+
+static void show_uprobe_multi_plain(struct bpf_link_info *info)
+{
+	__u32 i;
+
+	if (!info->uprobe_multi.count)
+		return;
+
+	if (info->uprobe_multi.flags & BPF_F_UPROBE_MULTI_RETURN)
+		printf("\n\turetprobe.multi  ");
+	else
+		printf("\n\tuprobe.multi  ");
+
+	printf("path %s  ", (char *) u64_to_ptr(info->uprobe_multi.path));
+	printf("func_cnt %u  ", info->uprobe_multi.count);
+
+	if (info->uprobe_multi.pid)
+		printf("pid %u  ", info->uprobe_multi.pid);
+
+	printf("\n\t%-16s   %-16s   %-16s", "offset", "ref_ctr_offset", "cookies");
+	for (i = 0; i < info->uprobe_multi.count; i++) {
+		printf("\n\t0x%-16llx 0x%-16llx 0x%-16llx",
+			u64_to_arr(info->uprobe_multi.offsets)[i],
+			u64_to_arr(info->uprobe_multi.ref_ctr_offsets)[i],
+			u64_to_arr(info->uprobe_multi.cookies)[i]);
 	}
 }
 
@@ -693,6 +806,8 @@ static void show_perf_event_kprobe_plain(struct bpf_link_info *info)
 		printf("+%#x", info->perf_event.kprobe.offset);
 	if (info->perf_event.kprobe.missed)
 		printf("  missed %llu", info->perf_event.kprobe.missed);
+	if (info->perf_event.kprobe.cookie)
+		printf("  cookie %llu", info->perf_event.kprobe.cookie);
 	printf("  ");
 }
 
@@ -709,6 +824,10 @@ static void show_perf_event_uprobe_plain(struct bpf_link_info *info)
 	else
 		printf("\n\tuprobe ");
 	printf("%s+%#x  ", buf, info->perf_event.uprobe.offset);
+	if (info->perf_event.uprobe.cookie)
+		printf("cookie %llu  ", info->perf_event.uprobe.cookie);
+	if (info->perf_event.uprobe.ref_ctr_offset)
+		printf("ref_ctr_offset 0x%llx  ", info->perf_event.uprobe.ref_ctr_offset);
 }
 
 static void show_perf_event_tracepoint_plain(struct bpf_link_info *info)
@@ -720,6 +839,8 @@ static void show_perf_event_tracepoint_plain(struct bpf_link_info *info)
 		return;
 
 	printf("\n\ttracepoint %s  ", buf);
+	if (info->perf_event.tracepoint.cookie)
+		printf("cookie %llu  ", info->perf_event.tracepoint.cookie);
 }
 
 static void show_perf_event_event_plain(struct bpf_link_info *info)
@@ -741,6 +862,9 @@ static void show_perf_event_event_plain(struct bpf_link_info *info)
 	else
 		printf("%llu  ", config);
 
+	if (info->perf_event.event.cookie)
+		printf("cookie %llu  ", info->perf_event.event.cookie);
+
 	if (type == PERF_TYPE_HW_CACHE && perf_config)
 		free((void *)perf_config);
 }
@@ -757,6 +881,8 @@ static int show_link_close_plain(int fd, struct bpf_link_info *info)
 	case BPF_LINK_TYPE_RAW_TRACEPOINT:
 		printf("\n\ttp '%s'  ",
 		       (const char *)u64_to_ptr(info->raw_tracepoint.tp_name));
+		if (info->raw_tracepoint.cookie)
+			printf("cookie %llu  ", info->raw_tracepoint.cookie);
 		break;
 	case BPF_LINK_TYPE_TRACING:
 		err = get_prog_info(info->prog_id, &prog_info);
@@ -775,6 +901,8 @@ static int show_link_close_plain(int fd, struct bpf_link_info *info)
 			printf("\n\ttarget_obj_id %u  target_btf_id %u  ",
 			       info->tracing.target_obj_id,
 			       info->tracing.target_btf_id);
+		if (info->tracing.cookie)
+			printf("\n\tcookie %llu  ", info->tracing.cookie);
 		break;
 	case BPF_LINK_TYPE_CGROUP:
 		printf("\n\tcgroup_id %zu  ", (size_t)info->cgroup.cgroup_id);
@@ -800,12 +928,20 @@ static int show_link_close_plain(int fd, struct bpf_link_info *info)
 		show_link_ifindex_plain(info->netkit.ifindex);
 		show_link_attach_type_plain(info->netkit.attach_type);
 		break;
+	case BPF_LINK_TYPE_SOCKMAP:
+		printf("\n\t");
+		printf("map_id %u  ", info->sockmap.map_id);
+		show_link_attach_type_plain(info->sockmap.attach_type);
+		break;
 	case BPF_LINK_TYPE_XDP:
 		printf("\n\t");
 		show_link_ifindex_plain(info->xdp.ifindex);
 		break;
 	case BPF_LINK_TYPE_KPROBE_MULTI:
 		show_kprobe_multi_plain(info);
+		break;
+	case BPF_LINK_TYPE_UPROBE_MULTI:
+		show_uprobe_multi_plain(info);
 		break;
 	case BPF_LINK_TYPE_PERF_EVENT:
 		switch (info->perf_event.type) {
@@ -846,8 +982,10 @@ static int show_link_close_plain(int fd, struct bpf_link_info *info)
 
 static int do_show_link(int fd)
 {
+	__u64 *ref_ctr_offsets = NULL, *offsets = NULL, *cookies = NULL;
 	struct bpf_link_info info;
 	__u32 len = sizeof(info);
+	char path_buf[PATH_MAX];
 	__u64 *addrs = NULL;
 	char buf[PATH_MAX];
 	int count;
@@ -886,6 +1024,47 @@ again:
 				return -ENOMEM;
 			}
 			info.kprobe_multi.addrs = ptr_to_u64(addrs);
+			cookies = calloc(count, sizeof(__u64));
+			if (!cookies) {
+				p_err("mem alloc failed");
+				free(addrs);
+				close(fd);
+				return -ENOMEM;
+			}
+			info.kprobe_multi.cookies = ptr_to_u64(cookies);
+			goto again;
+		}
+	}
+	if (info.type == BPF_LINK_TYPE_UPROBE_MULTI &&
+	    !info.uprobe_multi.offsets) {
+		count = info.uprobe_multi.count;
+		if (count) {
+			offsets = calloc(count, sizeof(__u64));
+			if (!offsets) {
+				p_err("mem alloc failed");
+				close(fd);
+				return -ENOMEM;
+			}
+			info.uprobe_multi.offsets = ptr_to_u64(offsets);
+			ref_ctr_offsets = calloc(count, sizeof(__u64));
+			if (!ref_ctr_offsets) {
+				p_err("mem alloc failed");
+				free(offsets);
+				close(fd);
+				return -ENOMEM;
+			}
+			info.uprobe_multi.ref_ctr_offsets = ptr_to_u64(ref_ctr_offsets);
+			cookies = calloc(count, sizeof(__u64));
+			if (!cookies) {
+				p_err("mem alloc failed");
+				free(ref_ctr_offsets);
+				free(offsets);
+				close(fd);
+				return -ENOMEM;
+			}
+			info.uprobe_multi.cookies = ptr_to_u64(cookies);
+			info.uprobe_multi.path = ptr_to_u64(path_buf);
+			info.uprobe_multi.path_size = sizeof(path_buf);
 			goto again;
 		}
 	}
@@ -924,8 +1103,10 @@ again:
 	else
 		show_link_close_plain(fd, &info);
 
-	if (addrs)
-		free(addrs);
+	free(ref_ctr_offsets);
+	free(cookies);
+	free(offsets);
+	free(addrs);
 	close(fd);
 	return 0;
 }

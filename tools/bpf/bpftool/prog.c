@@ -442,7 +442,7 @@ static void print_prog_header_json(struct bpf_prog_info *info, int fd)
 		jsonw_uint_field(json_wtr, "recursion_misses", info->recursion_misses);
 }
 
-static void print_prog_json(struct bpf_prog_info *info, int fd)
+static void print_prog_json(struct bpf_prog_info *info, int fd, bool orphaned)
 {
 	char *memlock;
 
@@ -461,6 +461,7 @@ static void print_prog_json(struct bpf_prog_info *info, int fd)
 		jsonw_uint_field(json_wtr, "uid", info->created_by_uid);
 	}
 
+	jsonw_bool_field(json_wtr, "orphaned", orphaned);
 	jsonw_uint_field(json_wtr, "bytes_xlated", info->xlated_prog_len);
 
 	if (info->jited_prog_len) {
@@ -520,14 +521,14 @@ static void print_prog_header_plain(struct bpf_prog_info *info, int fd)
 	print_dev_plain(info->ifindex, info->netns_dev, info->netns_ino);
 	printf("%s", info->gpl_compatible ? "  gpl" : "");
 	if (info->run_time_ns)
-		printf(" run_time_ns %lld run_cnt %lld",
+		printf(" run_time_ns %llu run_cnt %llu",
 		       info->run_time_ns, info->run_cnt);
 	if (info->recursion_misses)
-		printf(" recursion_misses %lld", info->recursion_misses);
+		printf(" recursion_misses %llu", info->recursion_misses);
 	printf("\n");
 }
 
-static void print_prog_plain(struct bpf_prog_info *info, int fd)
+static void print_prog_plain(struct bpf_prog_info *info, int fd, bool orphaned)
 {
 	char *memlock;
 
@@ -554,6 +555,9 @@ static void print_prog_plain(struct bpf_prog_info *info, int fd)
 		printf("  memlock %sB", memlock);
 	free(memlock);
 
+	if (orphaned)
+		printf("  orphaned");
+
 	if (info->nr_map_ids)
 		show_prog_maps(fd, info->nr_map_ids);
 
@@ -565,7 +569,7 @@ static void print_prog_plain(struct bpf_prog_info *info, int fd)
 	}
 
 	if (info->btf_id)
-		printf("\n\tbtf_id %d", info->btf_id);
+		printf("\n\tbtf_id %u", info->btf_id);
 
 	emit_obj_refs_plain(refs_table, info->id, "\n\tpids ");
 
@@ -581,15 +585,15 @@ static int show_prog(int fd)
 	int err;
 
 	err = bpf_prog_get_info_by_fd(fd, &info, &len);
-	if (err) {
+	if (err && err != -ENODEV) {
 		p_err("can't get prog info: %s", strerror(errno));
 		return -1;
 	}
 
 	if (json_output)
-		print_prog_json(&info, fd);
+		print_prog_json(&info, fd, err == -ENODEV);
 	else
-		print_prog_plain(&info, fd);
+		print_prog_plain(&info, fd, err == -ENODEV);
 
 	return 0;
 }
@@ -818,11 +822,18 @@ prog_dump(struct bpf_prog_info *info, enum dump_mode mode,
 					printf("%s:\n", sym_name);
 				}
 
-				if (disasm_print_insn(img, lens[i], opcodes,
-						      name, disasm_opt, btf,
-						      prog_linfo, ksyms[i], i,
-						      linum))
-					goto exit_free;
+				if (ksyms) {
+					if (disasm_print_insn(img, lens[i], opcodes,
+							      name, disasm_opt, btf,
+							      prog_linfo, ksyms[i], i,
+							      linum))
+						goto exit_free;
+				} else {
+					if (disasm_print_insn(img, lens[i], opcodes,
+							      name, disasm_opt, btf,
+							      NULL, 0, 0, false))
+						goto exit_free;
+				}
 
 				img += lens[i];
 
@@ -1051,7 +1062,7 @@ static int parse_attach_detach_args(int argc, char **argv, int *progfd,
 	if (!REQ_ARGS(2))
 		return -EINVAL;
 
-	*mapfd = map_parse_fd(&argc, &argv);
+	*mapfd = map_parse_fd(&argc, &argv, 0);
 	if (*mapfd < 0)
 		return *mapfd;
 
@@ -1100,6 +1111,52 @@ static int do_detach(int argc, char **argv)
 	if (json_output)
 		jsonw_null(json_wtr);
 	return 0;
+}
+
+enum prog_tracelog_mode {
+	TRACE_STDOUT,
+	TRACE_STDERR,
+};
+
+static int
+prog_tracelog_stream(int prog_fd, enum prog_tracelog_mode mode)
+{
+	FILE *file = mode == TRACE_STDOUT ? stdout : stderr;
+	int stream_id = mode == TRACE_STDOUT ? 1 : 2;
+	char buf[512];
+	int ret;
+
+	ret = 0;
+	do {
+		ret = bpf_prog_stream_read(prog_fd, stream_id, buf, sizeof(buf), NULL);
+		if (ret > 0)
+			fwrite(buf, sizeof(buf[0]), ret, file);
+	} while (ret > 0);
+
+	fflush(file);
+	return ret ? -1 : 0;
+}
+
+static int do_tracelog_any(int argc, char **argv)
+{
+	enum prog_tracelog_mode mode;
+	int fd;
+
+	if (argc == 0)
+		return do_tracelog(argc, argv);
+	if (!is_prefix(*argv, "stdout") && !is_prefix(*argv, "stderr"))
+		usage();
+	mode = is_prefix(*argv, "stdout") ? TRACE_STDOUT : TRACE_STDERR;
+	NEXT_ARG();
+
+	if (!REQ_ARGS(2))
+		return -1;
+
+	fd = prog_parse_fd(&argc, &argv);
+	if (fd < 0)
+		return -1;
+
+	return prog_tracelog_stream(fd, mode);
 }
 
 static int check_single_stdin(char *file_data_in, char *file_ctx_in)
@@ -1153,7 +1210,7 @@ static int get_run_data(const char *fname, void **data_ptr, unsigned int *size)
 		}
 		if (nb_read > buf_size - block_size) {
 			if (buf_size == UINT32_MAX) {
-				p_err("data_in/ctx_in is too long (max: %d)",
+				p_err("data_in/ctx_in is too long (max: %u)",
 				      UINT32_MAX);
 				goto err_free;
 			}
@@ -1597,7 +1654,7 @@ static int load_with_options(int argc, char **argv, bool first_prog_only)
 			}
 			NEXT_ARG();
 
-			fd = map_parse_fd(&argc, &argv);
+			fd = map_parse_fd(&argc, &argv, 0);
 			if (fd < 0)
 				goto err_free_reuse_maps;
 
@@ -1670,8 +1727,17 @@ offload_dev:
 		} else if (is_prefix(*argv, "autoattach")) {
 			auto_attach = true;
 			NEXT_ARG();
+		} else if (is_prefix(*argv, "kernel_btf")) {
+			NEXT_ARG();
+
+			if (!REQ_ARGS(1))
+				goto err_free_reuse_maps;
+
+			open_opts.btf_custom_path = GET_ARG();
 		} else {
-			p_err("expected no more arguments, 'type', 'map' or 'dev', got: '%s'?",
+			p_err("expected no more arguments, "
+			      "'type', 'map', 'offload_dev', 'xdpmeta_dev', 'pinmaps', "
+			      "'autoattach', or 'kernel_btf', got: '%s'?",
 			      *argv);
 			goto err_free_reuse_maps;
 		}
@@ -1774,7 +1840,10 @@ offload_dev:
 		goto err_close_obj;
 	}
 
-	err = mount_bpffs_for_pin(pinfile, !first_prog_only);
+	if (first_prog_only)
+		err = mount_bpffs_for_file(pinfile);
+	else
+		err = create_and_mount_bpffs_dir(pinfile);
 	if (err)
 		goto err_close_obj;
 
@@ -1806,6 +1875,10 @@ offload_dev:
 	}
 
 	if (pinmaps) {
+		err = create_and_mount_bpffs_dir(pinmaps);
+		if (err)
+			goto err_unpin;
+
 		err = bpf_object__pin_maps(obj, pinmaps);
 		if (err) {
 			p_err("failed to pin all maps");
@@ -1910,6 +1983,7 @@ static int do_loader(int argc, char **argv)
 
 	obj = bpf_object__open_file(file, &open_opts);
 	if (!obj) {
+		err = -1;
 		p_err("failed to open object file");
 		goto err_close_obj;
 	}
@@ -2074,7 +2148,7 @@ static int profile_parse_metrics(int argc, char **argv)
 		NEXT_ARG();
 	}
 	if (selected_cnt > MAX_NUM_PROFILE_METRICS) {
-		p_err("too many (%d) metrics, please specify no more than %d metrics at at time",
+		p_err("too many (%d) metrics, please specify no more than %d metrics at a time",
 		      selected_cnt, MAX_NUM_PROFILE_METRICS);
 		return -1;
 	}
@@ -2233,7 +2307,7 @@ static char *profile_target_name(int tgt_fd)
 
 	t = btf__type_by_id(btf, func_info.type_id);
 	if (!t) {
-		p_err("btf %d doesn't have type %d",
+		p_err("btf %u doesn't have type %u",
 		      info.btf_id, func_info.type_id);
 		goto out;
 	}
@@ -2294,7 +2368,7 @@ static int profile_open_perf_events(struct profiler_bpf *obj)
 	int map_fd;
 
 	profile_perf_events = calloc(
-		sizeof(int), obj->rodata->num_cpu * obj->rodata->num_metric);
+		obj->rodata->num_cpu * obj->rodata->num_metric, sizeof(int));
 	if (!profile_perf_events) {
 		p_err("failed to allocate memory for perf_event array: %s",
 		      strerror(errno));
@@ -2311,7 +2385,7 @@ static int profile_open_perf_events(struct profiler_bpf *obj)
 			continue;
 		for (cpu = 0; cpu < obj->rodata->num_cpu; cpu++) {
 			if (profile_open_perf_event(m, cpu, map_fd)) {
-				p_err("failed to create event %s on cpu %d",
+				p_err("failed to create event %s on cpu %u",
 				      metrics[m].name, cpu);
 				return -1;
 			}
@@ -2455,6 +2529,7 @@ static int do_help(int argc, char **argv)
 		"                         [map { idx IDX | name NAME } MAP]\\\n"
 		"                         [pinmaps MAP_DIR]\n"
 		"                         [autoattach]\n"
+		"                         [kernel_btf BTF_FILE]\n"
 		"       %1$s %2$s attach PROG ATTACH_TYPE [MAP]\n"
 		"       %1$s %2$s detach PROG ATTACH_TYPE [MAP]\n"
 		"       %1$s %2$s run PROG \\\n"
@@ -2464,6 +2539,7 @@ static int do_help(int argc, char **argv)
 		"                         [repeat N]\n"
 		"       %1$s %2$s profile PROG [duration DURATION] METRICs\n"
 		"       %1$s %2$s tracelog\n"
+		"       %1$s %2$s tracelog { stdout | stderr } PROG\n"
 		"       %1$s %2$s help\n"
 		"\n"
 		"       " HELP_SPEC_MAP "\n"
@@ -2478,7 +2554,7 @@ static int do_help(int argc, char **argv)
 		"                 cgroup/connect_unix | cgroup/getpeername4 | cgroup/getpeername6 |\n"
 		"                 cgroup/getpeername_unix | cgroup/getsockname4 | cgroup/getsockname6 |\n"
 		"                 cgroup/getsockname_unix | cgroup/sendmsg4 | cgroup/sendmsg6 |\n"
-		"                 cgroup/sendmsg°unix | cgroup/recvmsg4 | cgroup/recvmsg6 | cgroup/recvmsg_unix |\n"
+		"                 cgroup/sendmsg_unix | cgroup/recvmsg4 | cgroup/recvmsg6 | cgroup/recvmsg_unix |\n"
 		"                 cgroup/getsockopt | cgroup/setsockopt | cgroup/sock_release |\n"
 		"                 struct_ops | fentry | fexit | freplace | sk_lookup }\n"
 		"       ATTACH_TYPE := { sk_msg_verdict | sk_skb_verdict | sk_skb_stream_verdict |\n"
@@ -2503,7 +2579,7 @@ static const struct cmd cmds[] = {
 	{ "loadall",	do_loadall },
 	{ "attach",	do_attach },
 	{ "detach",	do_detach },
-	{ "tracelog",	do_tracelog },
+	{ "tracelog",	do_tracelog_any },
 	{ "run",	do_run },
 	{ "profile",	do_profile },
 	{ 0 }

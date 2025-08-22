@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// Copyright(c) 2019-2022 Intel Corporation. All rights reserved.
+// Copyright(c) 2019-2022 Intel Corporation
 //
 // Author: Cezary Rojewski <cezary.rojewski@intel.com>
 //
@@ -238,7 +238,6 @@ static ssize_t sof_probes_dfs_points_read(struct file *file, char __user *to,
 	kfree(desc);
 
 pm_error:
-	pm_runtime_mark_last_busy(dev);
 	err = pm_runtime_put_autosuspend(dev);
 	if (err < 0)
 		dev_err_ratelimited(dev, "debugfs read failed to idle %d\n", err);
@@ -289,7 +288,6 @@ sof_probes_dfs_points_write(struct file *file, const char __user *from,
 	if (!ret)
 		ret = count;
 
-	pm_runtime_mark_last_busy(dev);
 	err = pm_runtime_put_autosuspend(dev);
 	if (err < 0)
 		dev_err_ratelimited(dev, "debugfs write failed to idle %d\n", err);
@@ -337,7 +335,6 @@ sof_probes_dfs_points_remove_write(struct file *file, const char __user *from,
 	if (!ret)
 		ret = count;
 
-	pm_runtime_mark_last_busy(dev);
 	err = pm_runtime_put_autosuspend(dev);
 	if (err < 0)
 		dev_err_ratelimited(dev, "debugfs write failed to idle %d\n", err);
@@ -380,8 +377,6 @@ static const struct snd_soc_component_driver sof_probes_component = {
 	.module_get_upon_open = 1,
 	.legacy_dai_naming = 1,
 };
-
-SND_SOC_DAILINK_DEF(dummy, DAILINK_COMP_ARRAY(COMP_DUMMY()));
 
 static int sof_probes_client_probe(struct auxiliary_device *auxdev,
 				   const struct auxiliary_device_id *id)
@@ -475,7 +470,7 @@ static int sof_probes_client_probe(struct auxiliary_device *auxdev,
 	links[0].cpus = &cpus[0];
 	links[0].num_cpus = 1;
 	links[0].cpus->dai_name = "Probe Extraction CPU DAI";
-	links[0].codecs = dummy;
+	links[0].codecs = &snd_soc_dummy_dlc;
 	links[0].num_codecs = 1;
 	links[0].platforms = platform_component;
 	links[0].num_platforms = ARRAY_SIZE(platform_component);
@@ -542,6 +537,6 @@ static struct auxiliary_driver sof_probes_client_drv = {
 
 module_auxiliary_driver(sof_probes_client_drv);
 
-MODULE_DESCRIPTION("SOF Probes Client Driver");
 MODULE_LICENSE("GPL v2");
-MODULE_IMPORT_NS(SND_SOC_SOF_CLIENT);
+MODULE_DESCRIPTION("SOF Probes Client Driver");
+MODULE_IMPORT_NS("SND_SOC_SOF_CLIENT");

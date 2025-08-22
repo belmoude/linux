@@ -32,22 +32,24 @@ static int crypto_ecb_crypt(struct crypto_cipher *cipher, const u8 *src,
 }
 
 static int crypto_ecb_encrypt2(struct crypto_lskcipher *tfm, const u8 *src,
-			       u8 *dst, unsigned len, u8 *iv, bool final)
+			       u8 *dst, unsigned len, u8 *iv, u32 flags)
 {
 	struct crypto_cipher **ctx = crypto_lskcipher_ctx(tfm);
 	struct crypto_cipher *cipher = *ctx;
 
-	return crypto_ecb_crypt(cipher, src, dst, len, final,
+	return crypto_ecb_crypt(cipher, src, dst, len,
+				flags & CRYPTO_LSKCIPHER_FLAG_FINAL,
 				crypto_cipher_alg(cipher)->cia_encrypt);
 }
 
 static int crypto_ecb_decrypt2(struct crypto_lskcipher *tfm, const u8 *src,
-			       u8 *dst, unsigned len, u8 *iv, bool final)
+			       u8 *dst, unsigned len, u8 *iv, u32 flags)
 {
 	struct crypto_cipher **ctx = crypto_lskcipher_ctx(tfm);
 	struct crypto_cipher *cipher = *ctx;
 
-	return crypto_ecb_crypt(cipher, src, dst, len, final,
+	return crypto_ecb_crypt(cipher, src, dst, len,
+				flags & CRYPTO_LSKCIPHER_FLAG_FINAL,
 				crypto_cipher_alg(cipher)->cia_decrypt);
 }
 
@@ -217,10 +219,10 @@ static void __exit crypto_ecb_module_exit(void)
 	crypto_unregister_template(&crypto_ecb_tmpl);
 }
 
-subsys_initcall(crypto_ecb_module_init);
+module_init(crypto_ecb_module_init);
 module_exit(crypto_ecb_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("ECB block cipher mode of operation");
 MODULE_ALIAS_CRYPTO("ecb");
-MODULE_IMPORT_NS(CRYPTO_INTERNAL);
+MODULE_IMPORT_NS("CRYPTO_INTERNAL");

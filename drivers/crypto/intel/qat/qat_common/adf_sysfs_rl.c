@@ -32,9 +32,10 @@ enum rl_params {
 };
 
 static const char *const rl_services[] = {
-	[ADF_SVC_ASYM] = "asym",
-	[ADF_SVC_SYM] = "sym",
-	[ADF_SVC_DC] = "dc",
+	[SVC_ASYM] = "asym",
+	[SVC_SYM] = "sym",
+	[SVC_DC] = "dc",
+	[SVC_DECOMP] = "decomp",
 };
 
 static const char *const rl_operations[] = {
@@ -282,7 +283,7 @@ static ssize_t srv_show(struct device *dev, struct device_attribute *attr,
 	if (ret)
 		return ret;
 
-	if (get == ADF_SVC_NONE)
+	if (get == SVC_BASE_COUNT)
 		return -EINVAL;
 
 	return sysfs_emit(buf, "%s\n", rl_services[get]);
@@ -291,14 +292,22 @@ static ssize_t srv_show(struct device *dev, struct device_attribute *attr,
 static ssize_t srv_store(struct device *dev, struct device_attribute *attr,
 			 const char *buf, size_t count)
 {
+	struct adf_accel_dev *accel_dev;
 	unsigned int val;
 	int ret;
+
+	accel_dev = adf_devmgr_pci_to_accel_dev(to_pci_dev(dev));
+	if (!accel_dev)
+		return -EINVAL;
 
 	ret = sysfs_match_string(rl_services, buf);
 	if (ret < 0)
 		return ret;
 
 	val = ret;
+	if (!adf_is_service_enabled(accel_dev, val))
+		return -EINVAL;
+
 	ret = set_param_u(dev, SRV, val);
 	if (ret)
 		return ret;
@@ -439,13 +448,21 @@ int adf_sysfs_rl_add(struct adf_accel_dev *accel_dev)
 		dev_err(&GET_DEV(accel_dev),
 			"Failed to create qat_rl attribute group\n");
 
-	data->cap_rem_srv = ADF_SVC_NONE;
-	data->input.srv = ADF_SVC_NONE;
+	data->cap_rem_srv = SVC_BASE_COUNT;
+	data->input.srv = SVC_BASE_COUNT;
+	data->sysfs_added = true;
 
 	return ret;
 }
 
 void adf_sysfs_rl_rm(struct adf_accel_dev *accel_dev)
 {
+	struct adf_rl_interface_data *data;
+
+	data = &GET_RL_STRUCT(accel_dev);
+	if (!data->sysfs_added)
+		return;
+
 	device_remove_group(&GET_DEV(accel_dev), &qat_rl_group);
+	data->sysfs_added = false;
 }

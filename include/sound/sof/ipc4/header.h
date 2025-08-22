@@ -3,7 +3,7 @@
  * This file is provided under a dual BSD/GPLv2 license.  When using or
  * redistributing this file, you may do so under either license.
  *
- * Copyright(c) 2022 Intel Corporation. All rights reserved.
+ * Copyright(c) 2022 Intel Corporation
  */
 
 #ifndef __INCLUDE_SOUND_SOF_IPC4_HEADER_H__
@@ -396,6 +396,7 @@ enum sof_ipc4_base_fw_params {
 	SOF_IPC4_FW_PARAM_MODULES_INFO_GET,
 	SOF_IPC4_FW_PARAM_LIBRARIES_INFO_GET = 16,
 	SOF_IPC4_FW_PARAM_SYSTEM_TIME = 20,
+	SOF_IPC4_FW_PARAM_MIC_PRIVACY_STATE_CHANGE = 35,
 };
 
 enum sof_ipc4_fw_config_params {
@@ -423,6 +424,12 @@ enum sof_ipc4_fw_config_params {
 	SOF_IPC4_FW_CFG_RESERVED,
 	SOF_IPC4_FW_CFG_POWER_GATING_POLICY,
 	SOF_IPC4_FW_CFG_ASSERT_MODE,
+	SOF_IPC4_FW_RESERVED1,
+	SOF_IPC4_FW_RESERVED2,
+	SOF_IPC4_FW_RESERVED3,
+	SOF_IPC4_FW_RESERVED4,
+	SOF_IPC4_FW_RESERVED5,
+	SOF_IPC4_FW_CONTEXT_SAVE
 };
 
 struct sof_ipc4_fw_version {
@@ -439,6 +446,18 @@ struct sof_ipc4_dx_state_info {
 	/* core state: 0: put core_id to D3; 1: put core_id to D0 */
 	uint32_t dx_mask;
 } __packed __aligned(4);
+
+enum sof_ipc4_hw_config_params {
+	SOF_IPC4_HW_CFG_INTEL_MIC_PRIVACY_CAPS = 11,
+};
+
+#define SOF_IPC_INTEL_MIC_PRIVACY_VERSION_PTL	1
+
+struct sof_ipc4_intel_mic_privacy_cap {
+	uint32_t version;
+	uint32_t capabilities_length;
+	uint32_t capabilities[];
+} __packed;
 
 /* Reply messages */
 
@@ -478,6 +497,8 @@ struct sof_ipc4_dx_state_info {
 #define SOF_IPC4_LOG_CORE_MASK			GENMASK(15, 12)
 #define SOF_IPC4_LOG_CORE_GET(x)		(((x) & SOF_IPC4_LOG_CORE_MASK) >> \
 						 SOF_IPC4_LOG_CORE_SHIFT)
+
+#define SOF_IPC4_FW_READY_LIB_RESTORED		BIT(15)
 
 /* Value of notification type field - must fit into 8 bits */
 enum sof_ipc4_notification_type {
@@ -531,6 +552,35 @@ struct sof_ipc4_notify_resource_data {
 #define SOF_IPC4_DEBUG_SLOT_GDB_STUB		0x42444700
 #define SOF_IPC4_DEBUG_SLOT_TELEMETRY		0x4c455400
 #define SOF_IPC4_DEBUG_SLOT_BROKEN		0x44414544
+
+/**
+ * struct sof_ipc4_notify_module_data - payload for module notification
+ * @instance_id: instance ID of the originator module of the notification
+ * @module_id: module ID of the originator of the notification
+ * @event_id: module specific event id
+ * @event_data_size: Size of the @event_data (if any) in bytes
+ * @event_data: Optional notification data, module and notification dependent
+ */
+struct sof_ipc4_notify_module_data {
+	uint16_t instance_id;
+	uint16_t module_id;
+	uint32_t event_id;
+	uint32_t event_data_size;
+	uint8_t event_data[];
+} __packed __aligned(4);
+
+/*
+ * ALSA kcontrol change notification
+ *
+ * The event_id of struct sof_ipc4_notify_module_data is divided into two u16:
+ *  upper u16: magic number for ALSA kcontrol types: 0xA15A
+ *  lower u16: param_id of the control, which is the type of the control
+ * The event_data contains the struct sof_ipc4_control_msg_payload of the control
+ * which sent the notification.
+ */
+#define SOF_IPC4_NOTIFY_MODULE_EVENTID_ALSA_MAGIC_MASK		GENMASK(31, 16)
+#define SOF_IPC4_NOTIFY_MODULE_EVENTID_ALSA_MAGIC_VAL		0xA15A0000
+#define SOF_IPC4_NOTIFY_MODULE_EVENTID_ALSA_PARAMID_MASK	GENMASK(15, 0)
 
 /** @}*/
 

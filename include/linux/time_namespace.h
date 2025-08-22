@@ -7,9 +7,13 @@
 #include <linux/nsproxy.h>
 #include <linux/ns_common.h>
 #include <linux/err.h>
+#include <linux/time64.h>
 
 struct user_namespace;
 extern struct user_namespace init_user_ns;
+
+struct seq_file;
+struct vm_area_struct;
 
 struct timens_offsets {
 	struct timespec64 monotonic;
@@ -161,7 +165,5 @@ static inline ktime_t timens_ktime_to_host(clockid_t clockid, ktime_t tim)
 	return tim;
 }
 #endif
-
-struct vdso_data *arch_get_vdso_data(void *vvar_page);
 
 #endif /* _LINUX_TIMENS_H */

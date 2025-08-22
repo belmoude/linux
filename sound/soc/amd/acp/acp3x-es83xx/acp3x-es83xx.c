@@ -19,6 +19,7 @@
 #include <linux/io.h>
 #include <linux/acpi.h>
 #include <linux/dmi.h>
+#include <linux/string_choices.h>
 #include "../acp-mach.h"
 #include "acp3x-es83xx.h"
 
@@ -222,7 +223,6 @@ static int acp3x_es83xx_resume_post(struct snd_soc_card *card)
 
 static int acp3x_es83xx_configure_gpios(struct acp3x_es83xx_private *priv)
 {
-	int ret = 0;
 
 	priv->enable_spk_gpio.crs_entry_index = 0;
 	priv->enable_hp_gpio.crs_entry_index = 1;
@@ -242,10 +242,10 @@ static int acp3x_es83xx_configure_gpios(struct acp3x_es83xx_private *priv)
 
 	dev_info(priv->codec_dev, "speaker gpio %d active %s, headphone gpio %d active %s\n",
 		 priv->enable_spk_gpio.crs_entry_index,
-		 priv->enable_spk_gpio.active_low ? "low" : "high",
+		 str_low_high(priv->enable_spk_gpio.active_low),
 		 priv->enable_hp_gpio.crs_entry_index,
-		 priv->enable_hp_gpio.active_low ? "low" : "high");
-	return ret;
+		 str_low_high(priv->enable_hp_gpio.active_low));
+	return 0;
 }
 
 static int acp3x_es83xx_configure_mics(struct acp3x_es83xx_private *priv)
@@ -354,6 +354,14 @@ static const struct dmi_system_id acp3x_es83xx_dmi_table[] = {
 			DMI_EXACT_MATCH(DMI_PRODUCT_VERSION, "M1010"),
 		},
 		.driver_data = (void *)(ES83XX_ENABLE_DMIC|ES83XX_48_MHZ_MCLK),
+	},
+	{
+		.matches = {
+			DMI_EXACT_MATCH(DMI_BOARD_VENDOR, "HUAWEI"),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "HVY-WXX9"),
+			DMI_EXACT_MATCH(DMI_PRODUCT_VERSION, "M1010"),
+		},
+		.driver_data = (void *)(ES83XX_ENABLE_DMIC),
 	},
 	{
 		.matches = {

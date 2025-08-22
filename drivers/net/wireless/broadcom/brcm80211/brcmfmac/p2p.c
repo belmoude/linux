@@ -1403,7 +1403,7 @@ int brcmf_p2p_notify_action_frame_rx(struct brcmf_if *ifp,
 	u8 action;
 
 	if (e->datalen < sizeof(*rxframe)) {
-		brcmf_dbg(SCAN, "Event data to small. Ignore\n");
+		brcmf_dbg(SCAN, "Event data too small. Ignore\n");
 		return 0;
 	}
 
@@ -1949,7 +1949,7 @@ s32 brcmf_p2p_notify_rx_mgmt_p2p_probereq(struct brcmf_if *ifp,
 		  e->reason);
 
 	if (e->datalen < sizeof(*rxframe)) {
-		brcmf_dbg(SCAN, "Event data to small. Ignore\n");
+		brcmf_dbg(SCAN, "Event data too small. Ignore\n");
 		return 0;
 	}
 
@@ -2334,7 +2334,7 @@ struct wireless_dev *brcmf_p2p_add_vif(struct wiphy *wiphy, const char *name,
 		goto fail;
 	}
 
-	strncpy(ifp->ndev->name, name, sizeof(ifp->ndev->name) - 1);
+	strscpy(ifp->ndev->name, name, sizeof(ifp->ndev->name));
 	ifp->ndev->name_assign_type = name_assign_type;
 	err = brcmf_net_attach(ifp, true);
 	if (err) {

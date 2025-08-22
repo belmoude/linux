@@ -21,6 +21,7 @@
 #include <linux/interrupt.h>
 #include <linux/sysctl.h>
 #include <linux/list.h>
+#include <linux/rcupdate_wait.h>
 
 #include <net/ip_vs.h>
 
@@ -264,7 +265,8 @@ int ip_vs_est_kthread_start(struct netns_ipvs *ipvs,
 	}
 
 	set_user_nice(kd->task, sysctl_est_nice(ipvs));
-	set_cpus_allowed_ptr(kd->task, sysctl_est_cpulist(ipvs));
+	if (sysctl_est_preferred_cpulist(ipvs))
+		kthread_affine_preferred(kd->task, sysctl_est_preferred_cpulist(ipvs));
 
 	pr_info("starting estimator thread %d...\n", kd->id);
 	wake_up_process(kd->task);

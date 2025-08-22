@@ -525,8 +525,6 @@ static const struct vb2_ops s3c_camif_qops = {
 	.queue_setup	 = queue_setup,
 	.buf_prepare	 = buffer_prepare,
 	.buf_queue	 = buffer_queue,
-	.wait_prepare	 = vb2_ops_wait_prepare,
-	.wait_finish	 = vb2_ops_wait_finish,
 	.start_streaming = start_streaming,
 	.stop_streaming	 = stop_streaming,
 };
@@ -1032,9 +1030,9 @@ static int s3c_camif_s_selection(struct file *file, void *priv,
 	vp->state |= ST_VP_CONFIG;
 	spin_unlock_irqrestore(&camif->slock, flags);
 
-	pr_debug("type: %#x, target: %#x, flags: %#x, (%d,%d)/%dx%d\n",
-		sel->type, sel->target, sel->flags,
-		sel->r.left, sel->r.top, sel->r.width, sel->r.height);
+	pr_debug("type: %#x, target: %#x, flags: %#x, (%d,%d)/%ux%u\n",
+		 sel->type, sel->target, sel->flags,
+		 sel->r.left, sel->r.top, sel->r.width, sel->r.height);
 
 	return 0;
 }
@@ -1216,7 +1214,7 @@ static int s3c_camif_subdev_get_fmt(struct v4l2_subdev *sd,
 	struct v4l2_mbus_framefmt *mf = &fmt->format;
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-		mf = v4l2_subdev_get_try_format(sd, sd_state, fmt->pad);
+		mf = v4l2_subdev_state_get_format(sd_state, fmt->pad);
 		fmt->format = *mf;
 		return 0;
 	}
@@ -1305,7 +1303,7 @@ static int s3c_camif_subdev_set_fmt(struct v4l2_subdev *sd,
 	__camif_subdev_try_format(camif, mf, fmt->pad);
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-		mf = v4l2_subdev_get_try_format(sd, sd_state, fmt->pad);
+		mf = v4l2_subdev_state_get_format(sd_state, fmt->pad);
 		*mf = fmt->format;
 		mutex_unlock(&camif->lock);
 		return 0;
@@ -1357,7 +1355,7 @@ static int s3c_camif_subdev_get_selection(struct v4l2_subdev *sd,
 		return -EINVAL;
 
 	if (sel->which == V4L2_SUBDEV_FORMAT_TRY) {
-		sel->r = *v4l2_subdev_get_try_crop(sd, sd_state, sel->pad);
+		sel->r = *v4l2_subdev_state_get_crop(sd_state, sel->pad);
 		return 0;
 	}
 
@@ -1374,7 +1372,7 @@ static int s3c_camif_subdev_get_selection(struct v4l2_subdev *sd,
 
 	mutex_unlock(&camif->lock);
 
-	v4l2_dbg(1, debug, sd, "%s: crop: (%d,%d) %dx%d, size: %ux%u\n",
+	v4l2_dbg(1, debug, sd, "%s: crop: (%d,%d)/%ux%u, size: %ux%u\n",
 		 __func__, crop->left, crop->top, crop->width,
 		 crop->height, mf->width, mf->height);
 
@@ -1426,7 +1424,7 @@ static void __camif_try_crop(struct camif_dev *camif, struct v4l2_rect *r)
 		}
 	}
 
-	v4l2_dbg(1, debug, &camif->v4l2_dev, "crop: (%d,%d)/%dx%d, fmt: %ux%u\n",
+	v4l2_dbg(1, debug, &camif->v4l2_dev, "crop: (%d,%d)/%ux%u, fmt: %ux%u\n",
 		 r->left, r->top, r->width, r->height, mf->width, mf->height);
 }
 
@@ -1445,7 +1443,7 @@ static int s3c_camif_subdev_set_selection(struct v4l2_subdev *sd,
 	__camif_try_crop(camif, &sel->r);
 
 	if (sel->which == V4L2_SUBDEV_FORMAT_TRY) {
-		*v4l2_subdev_get_try_crop(sd, sd_state, sel->pad) = sel->r;
+		*v4l2_subdev_state_get_crop(sd_state, sel->pad) = sel->r;
 	} else {
 		unsigned long flags;
 		unsigned int i;
@@ -1466,7 +1464,7 @@ static int s3c_camif_subdev_set_selection(struct v4l2_subdev *sd,
 	}
 	mutex_unlock(&camif->lock);
 
-	v4l2_dbg(1, debug, sd, "%s: (%d,%d) %dx%d, f_w: %u, f_h: %u\n",
+	v4l2_dbg(1, debug, sd, "%s: (%d,%d)/%ux%u, f_w: %u, f_h: %u\n",
 		 __func__, crop->left, crop->top, crop->width, crop->height,
 		 camif->mbus_fmt.width, camif->mbus_fmt.height);
 

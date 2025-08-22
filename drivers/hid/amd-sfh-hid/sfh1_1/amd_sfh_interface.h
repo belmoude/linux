@@ -22,8 +22,9 @@ enum sensor_index {
 	ACCEL_IDX,
 	GYRO_IDX,
 	MAG_IDX,
-	ALS_IDX = 4,
-	HPD_IDX = 5,
+	SRA_IDX,
+	ALS_IDX,
+	HPD_IDX,
 	MAX_IDX = 15,
 };
 
@@ -164,6 +165,27 @@ struct hpd_status {
 	};
 };
 
+struct sfh_op_mode {
+	union {
+		u32 val;
+		struct {
+			u32 mode		: 3;
+			u32 lidstatus		: 1;
+			u32 angle		: 10;
+			u32 inbagstatedbg	: 2;
+			u32 ontablestate	: 2;
+			u32 inbagstate		: 2;
+			u32 outbagstate		: 2;
+			u32 inbagmlcstate	: 1;
+			u32 powerstate		: 2;
+			u32 data		: 3;
+			u32 devicemode		: 4;
+		} op_mode;
+	};
+};
+
 void sfh_interface_init(struct amd_mp2_dev *mp2);
+void sfh_deinit_emp2(void);
 void amd_sfh1_1_set_desc_ops(struct amd_mp2_ops *mp2_ops);
+int amd_sfh_float_to_int(u32 flt32_val);
 #endif

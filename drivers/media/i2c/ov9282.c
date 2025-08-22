@@ -4,7 +4,7 @@
  *
  * Copyright (C) 2021 Intel Corporation
  */
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -40,9 +40,18 @@
 /* Exposure control */
 #define OV9282_REG_EXPOSURE	0x3500
 #define OV9282_EXPOSURE_MIN	1
-#define OV9282_EXPOSURE_OFFSET	12
+#define OV9282_EXPOSURE_OFFSET	25
 #define OV9282_EXPOSURE_STEP	1
 #define OV9282_EXPOSURE_DEFAULT	0x0282
+
+/* AEC/AGC manual */
+#define OV9282_REG_AEC_MANUAL		0x3503
+#define OV9282_DIGFRAC_GAIN_DELAY	BIT(6)
+#define OV9282_GAIN_CHANGE_DELAY	BIT(5)
+#define OV9282_GAIN_DELAY		BIT(4)
+#define OV9282_GAIN_PREC16_EN		BIT(3)
+#define OV9282_GAIN_MANUAL_AS_SENSGAIN	BIT(2)
+#define OV9282_AEC_MANUAL_DEFAULT	0x00
 
 /* Analog gain control */
 #define OV9282_REG_AGAIN	0x3509
@@ -214,7 +223,7 @@ static const struct ov9282_reg common_regs[] = {
 	{0x3030, 0x10},
 	{0x3039, 0x32},
 	{0x303a, 0x00},
-	{0x3503, 0x08},
+	{OV9282_REG_AEC_MANUAL, OV9282_GAIN_PREC16_EN},
 	{0x3505, 0x8c},
 	{0x3507, 0x03},
 	{0x3508, 0x00},
@@ -296,8 +305,8 @@ static const struct ov9282_reg mode_1280x800_regs[] = {
 	{0x3813, 0x08},
 	{0x3814, 0x11},
 	{0x3815, 0x11},
-	{0x3820, 0x40},
-	{0x3821, 0x00},
+	{OV9282_REG_TIMING_FORMAT_1, 0x40},
+	{OV9282_REG_TIMING_FORMAT_2, 0x00},
 	{0x4003, 0x40},
 	{0x4008, 0x04},
 	{0x4009, 0x0b},
@@ -327,8 +336,8 @@ static const struct ov9282_reg mode_1280x720_regs[] = {
 	{0x3813, 0x08},
 	{0x3814, 0x11},
 	{0x3815, 0x11},
-	{0x3820, 0x3c},
-	{0x3821, 0x84},
+	{OV9282_REG_TIMING_FORMAT_1, 0x3c},
+	{OV9282_REG_TIMING_FORMAT_2, 0x84},
 	{0x4003, 0x40},
 	{0x4008, 0x02},
 	{0x4009, 0x05},
@@ -358,8 +367,8 @@ static const struct ov9282_reg mode_640x400_regs[] = {
 	{0x3813, 0x04},
 	{0x3814, 0x31},
 	{0x3815, 0x22},
-	{0x3820, 0x60},
-	{0x3821, 0x01},
+	{OV9282_REG_TIMING_FORMAT_1, 0x60},
+	{OV9282_REG_TIMING_FORMAT_2, 0x01},
 	{0x4008, 0x02},
 	{0x4009, 0x05},
 	{0x400c, 0x00},
@@ -814,7 +823,7 @@ static int ov9282_get_pad_format(struct v4l2_subdev *sd,
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 		struct v4l2_mbus_framefmt *framefmt;
 
-		framefmt = v4l2_subdev_get_try_format(sd, sd_state, fmt->pad);
+		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad);
 		fmt->format = *framefmt;
 	} else {
 		ov9282_fill_pad_format(ov9282, ov9282->cur_mode, ov9282->code,
@@ -860,7 +869,7 @@ static int ov9282_set_pad_format(struct v4l2_subdev *sd,
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 		struct v4l2_mbus_framefmt *framefmt;
 
-		framefmt = v4l2_subdev_get_try_format(sd, sd_state, fmt->pad);
+		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad);
 		*framefmt = fmt->format;
 	} else {
 		ret = ov9282_update_controls(ov9282, mode, fmt);
@@ -876,14 +885,14 @@ static int ov9282_set_pad_format(struct v4l2_subdev *sd,
 }
 
 /**
- * ov9282_init_pad_cfg() - Initialize sub-device pad configuration
+ * ov9282_init_state() - Initialize sub-device state
  * @sd: pointer to ov9282 V4L2 sub-device structure
  * @sd_state: V4L2 sub-device configuration
  *
  * Return: 0 if successful, error code otherwise.
  */
-static int ov9282_init_pad_cfg(struct v4l2_subdev *sd,
-			       struct v4l2_subdev_state *sd_state)
+static int ov9282_init_state(struct v4l2_subdev *sd,
+			     struct v4l2_subdev_state *sd_state)
 {
 	struct ov9282 *ov9282 = to_ov9282(sd);
 	struct v4l2_subdev_format fmt = { 0 };
@@ -902,7 +911,7 @@ __ov9282_get_pad_crop(struct ov9282 *ov9282,
 {
 	switch (which) {
 	case V4L2_SUBDEV_FORMAT_TRY:
-		return v4l2_subdev_get_try_crop(&ov9282->sd, sd_state, pad);
+		return v4l2_subdev_state_get_crop(sd_state, pad);
 	case V4L2_SUBDEV_FORMAT_ACTIVE:
 		return &ov9282->cur_mode->crop;
 	}
@@ -1192,7 +1201,6 @@ static const struct v4l2_subdev_video_ops ov9282_video_ops = {
 };
 
 static const struct v4l2_subdev_pad_ops ov9282_pad_ops = {
-	.init_cfg = ov9282_init_pad_cfg,
 	.enum_mbus_code = ov9282_enum_mbus_code,
 	.enum_frame_size = ov9282_enum_frame_size,
 	.get_fmt = ov9282_get_pad_format,
@@ -1204,6 +1212,10 @@ static const struct v4l2_subdev_ops ov9282_subdev_ops = {
 	.core = &ov9282_core_ops,
 	.video = &ov9282_video_ops,
 	.pad = &ov9282_pad_ops,
+};
+
+static const struct v4l2_subdev_internal_ops ov9282_internal_ops = {
+	.init_state = ov9282_init_state,
 };
 
 /**
@@ -1394,6 +1406,7 @@ static int ov9282_probe(struct i2c_client *client)
 
 	/* Initialize subdev */
 	v4l2_i2c_subdev_init(&ov9282->sd, client, &ov9282_subdev_ops);
+	ov9282->sd.internal_ops = &ov9282_internal_ops;
 	v4l2_i2c_subdev_set_name(&ov9282->sd, client,
 				 device_get_match_data(ov9282->dev), NULL);
 

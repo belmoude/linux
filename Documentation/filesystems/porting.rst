@@ -177,7 +177,7 @@ settles down a bit.
 **mandatory**
 
 s_export_op is now required for exporting a filesystem.
-isofs, ext2, ext3, reiserfs, fat
+isofs, ext2, ext3, fat
 can be used as examples of very different filesystems.
 
 ---
@@ -313,7 +313,7 @@ done.
 
 **mandatory**
 
-block truncatation on error exit from ->write_begin, and ->direct_IO
+block truncation on error exit from ->write_begin, and ->direct_IO
 moved from generic methods (block_write_begin, cont_write_begin,
 nobh_write_begin, blockdev_direct_IO*) to callers.  Take a look at
 ext2_write_failed and callers for an example.
@@ -858,7 +858,7 @@ be misspelled d_alloc_anon().
 
 **mandatory**
 
-[should've been added in 2016] stale comment in finish_open() nonwithstanding,
+[should've been added in 2016] stale comment in finish_open() notwithstanding,
 failure exits in ->atomic_open() instances should *NOT* fput() the file,
 no matter what.  Everything is handled by the caller.
 
@@ -989,7 +989,7 @@ This mechanism would only work for a single device so the block layer couldn't
 find the owning superblock of any additional devices.
 
 In the old mechanism reusing or creating a superblock for a racing mount(2) and
-umount(2) relied on the file_system_type as the holder. This was severly
+umount(2) relied on the file_system_type as the holder. This was severely
 underdocumented however:
 
 (1) Any concurrent mounter that managed to grab an active reference on an
@@ -1064,6 +1064,67 @@ generic_encode_ino32_fh() explicitly.
 
 ---
 
+**mandatory**
+
+If ->rename() update of .. on cross-directory move needs an exclusion with
+directory modifications, do *not* lock the subdirectory in question in your
+->rename() - it's done by the caller now [that item should've been added in
+28eceeda130f "fs: Lock moved directories"].
+
+---
+
+**mandatory**
+
+On same-directory ->rename() the (tautological) update of .. is not protected
+by any locks; just don't do it if the old parent is the same as the new one.
+We really can't lock two subdirectories in same-directory rename - not without
+deadlocks.
+
+---
+
+**mandatory**
+
+lock_rename() and lock_rename_child() may fail in cross-directory case, if
+their arguments do not have a common ancestor.  In that case ERR_PTR(-EXDEV)
+is returned, with no locks taken.  In-tree users updated; out-of-tree ones
+would need to do so.
+
+---
+
+**mandatory**
+
+The list of children anchored in parent dentry got turned into hlist now.
+Field names got changed (->d_children/->d_sib instead of ->d_subdirs/->d_child
+for anchor/entries resp.), so any affected places will be immediately caught
+by compiler.
+
+---
+
+**mandatory**
+
+->d_delete() instances are now called for dentries with ->d_lock held
+and refcount equal to 0.  They are not permitted to drop/regain ->d_lock.
+None of in-tree instances did anything of that sort.  Make sure yours do not...
+
+---
+
+**mandatory**
+
+->d_prune() instances are now called without ->d_lock held on the parent.
+->d_lock on dentry itself is still held; if you need per-parent exclusions (none
+of the in-tree instances did), use your own spinlock.
+
+->d_iput() and ->d_release() are called with victim dentry still in the
+list of parent's children.  It is still unhashed, marked killed, etc., just not
+removed from parent's ->d_children yet.
+
+Anyone iterating through the list of children needs to be aware of the
+half-killed dentries that might be seen there; taking ->d_lock on those will
+see them negative, unhashed and with negative refcount, which means that most
+of the in-kernel users would've done the right thing anyway without any adjustment.
+
+---
+
 **recommended**
 
 Block device freezing and thawing have been moved to holder operations.
@@ -1073,3 +1134,154 @@ superblock of the main block device, i.e., the one stored in sb->s_bdev. Block
 device freezing now works for any block device owned by a given superblock, not
 just the main block device. The get_active_super() helper and bd_fsfreeze_sb
 pointer are gone.
+
+---
+
+**mandatory**
+
+set_blocksize() takes opened struct file instead of struct block_device now
+and it *must* be opened exclusive.
+
+---
+
+**mandatory**
+
+->d_revalidate() gets two extra arguments - inode of parent directory and
+name our dentry is expected to have.  Both are stable (dir is pinned in
+non-RCU case and will stay around during the call in RCU case, and name
+is guaranteed to stay unchanging).  Your instance doesn't have to use
+either, but it often helps to avoid a lot of painful boilerplate.
+Note that while name->name is stable and NUL-terminated, it may (and
+often will) have name->name[name->len] equal to '/' rather than '\0' -
+in normal case it points into the pathname being looked up.
+NOTE: if you need something like full path from the root of filesystem,
+you are still on your own - this assists with simple cases, but it's not
+magic.
+
+---
+
+**recommended**
+
+kern_path_locked() and user_path_locked() no longer return a negative
+dentry so this doesn't need to be checked.  If the name cannot be found,
+ERR_PTR(-ENOENT) is returned.
+
+---
+
+**recommended**
+
+lookup_one_qstr_excl() is changed to return errors in more cases, so
+these conditions don't require explicit checks:
+
+ - if LOOKUP_CREATE is NOT given, then the dentry won't be negative,
+   ERR_PTR(-ENOENT) is returned instead
+ - if LOOKUP_EXCL IS given, then the dentry won't be positive,
+   ERR_PTR(-EEXIST) is rreturned instread
+
+LOOKUP_EXCL now means "target must not exist".  It can be combined with
+LOOK_CREATE or LOOKUP_RENAME_TARGET.
+
+---
+
+**mandatory**
+invalidate_inodes() is gone use evict_inodes() instead.
+
+---
+
+**mandatory**
+
+->mkdir() now returns a dentry.  If the created inode is found to
+already be in cache and have a dentry (often IS_ROOT()), it will need to
+be spliced into the given name in place of the given dentry. That dentry
+now needs to be returned.  If the original dentry is used, NULL should
+be returned.  Any error should be returned with ERR_PTR().
+
+In general, filesystems which use d_instantiate_new() to install the new
+inode can safely return NULL.  Filesystems which may not have an I_NEW inode
+should use d_drop();d_splice_alias() and return the result of the latter.
+
+If a positive dentry cannot be returned for some reason, in-kernel
+clients such as cachefiles, nfsd, smb/server may not perform ideally but
+will fail-safe.
+
+---
+
+** mandatory**
+
+lookup_one(), lookup_one_unlocked(), lookup_one_positive_unlocked() now
+take a qstr instead of a name and len.  These, not the "one_len"
+versions, should be used whenever accessing a filesystem from outside
+that filesysmtem, through a mount point - which will have a mnt_idmap.
+
+---
+
+** mandatory**
+
+Functions try_lookup_one_len(), lookup_one_len(),
+lookup_one_len_unlocked() and lookup_positive_unlocked() have been
+renamed to try_lookup_noperm(), lookup_noperm(),
+lookup_noperm_unlocked(), lookup_noperm_positive_unlocked().  They now
+take a qstr instead of separate name and length.  QSTR() can be used
+when strlen() is needed for the length.
+
+These function no longer do any permission checking - they previously
+checked that the caller has 'X' permission on the parent.  They must
+ONLY be used internally by a filesystem on itself when it knows that
+permissions are irrelevant or in a context where permission checks have
+already been performed such as after vfs_path_parent_lookup()
+
+---
+
+** mandatory**
+
+d_hash_and_lookup() is no longer exported or available outside the VFS.
+Use try_lookup_noperm() instead.  This adds name validation and takes
+arguments in the opposite order but is otherwise identical.
+
+Using try_lookup_noperm() will require linux/namei.h to be included.
+
+---
+
+**mandatory**
+
+Calling conventions for ->d_automount() have changed; we should *not* grab
+an extra reference to new mount - it should be returned with refcount 1.
+
+---
+
+collect_mounts()/drop_collected_mounts()/iterate_mounts() are gone now.
+Replacement is collect_paths()/drop_collected_path(), with no special
+iterator needed.  Instead of a cloned mount tree, the new interface returns
+an array of struct path, one for each mount collect_mounts() would've
+created.  These struct path point to locations in the caller's namespace
+that would be roots of the cloned mounts.
+
+---
+
+**mandatory**
+
+If your filesystem sets the default dentry_operations, use set_default_d_op()
+rather than manually setting sb->s_d_op.
+
+---
+
+**mandatory**
+
+d_set_d_op() is no longer exported (or public, for that matter); _if_
+your filesystem really needed that, make use of d_splice_alias_ops()
+to have them set.  Better yet, think hard whether you need different
+->d_op for different dentries - if not, just use set_default_d_op()
+at mount time and be done with that.  Currently procfs is the only
+thing that really needs ->d_op varying between dentries.
+
+---
+
+**highly recommended**
+
+The file operations mmap() callback is deprecated in favour of
+mmap_prepare(). This passes a pointer to a vm_area_desc to the callback
+rather than a VMA, as the VMA at this stage is not yet valid.
+
+The vm_area_desc provides the minimum required information for a filesystem
+to initialise state upon memory mapping of a file-backed region, and output
+parameters for the file system to set this state.

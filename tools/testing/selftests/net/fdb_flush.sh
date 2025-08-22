@@ -5,6 +5,8 @@
 # Check that flush works as expected with all the supported arguments and verify
 # some combinations of arguments.
 
+source lib.sh
+
 FLUSH_BY_STATE_TESTS="
 	vxlan_test_flush_by_permanent
 	vxlan_test_flush_by_nopermanent
@@ -581,7 +583,7 @@ vxlan_test_flush_by_remote_attributes()
 	$IP link del dev vx10
 	$IP link add name vx10 type vxlan dstport "$VXPORT" external
 
-	# For multicat FDB entries, the VXLAN driver stores a linked list of
+	# For multicast FDB entries, the VXLAN driver stores a linked list of
 	# remotes for a given key. Verify that only the expected remotes are
 	# flushed.
 	multicast_fdb_entries_add
@@ -739,10 +741,9 @@ bridge_vxlan_test_flush()
 
 setup()
 {
-	IP="ip -netns ns1"
-	BRIDGE="bridge -netns ns1"
-
-	ip netns add ns1
+	setup_ns NS
+	IP="ip -netns ${NS}"
+	BRIDGE="bridge -netns ${NS}"
 
 	$IP link add name vx10 type vxlan id 1000 dstport "$VXPORT"
 	$IP link add name vx20 type vxlan id 2000 dstport "$VXPORT"
@@ -759,7 +760,7 @@ cleanup()
 	$IP link del dev vx20
 	$IP link del dev vx10
 
-	ip netns del ns1
+	cleanup_ns ${NS}
 }
 
 ################################################################################
