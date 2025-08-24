@@ -22,6 +22,8 @@
 #include <linux/cc_platform.h>
 #include <linux/set_memory.h>
 #include <linux/memregion.h>
+#include <linux/rmap.h>
+#include <linux/slab.h>
 
 #include <asm/e820/api.h>
 #include <asm/processor.h>
@@ -2379,11 +2381,101 @@ int set_memory_global(unsigned long addr, int numpages)
  * __set_memory_enc_pgtable() is used for the hypervisors that get
  * informed about "encryption" status via page tables.
  */
+static struct folio **mem_enc_block_concurrent_access(unsigned long addr, int numpages, unsigned int *out_count)
+{
+	unsigned long i;
+	struct folio *last = NULL;
+	struct folio **blocked;
+	unsigned int count = 0;
+
+	blocked = kcalloc(numpages, sizeof(*blocked), GFP_KERNEL);
+	if (!blocked) {
+		/* Best effort: proceed without gating list (no pin), still stall access */
+		for (i = 0; i < numpages; i++) {
+			unsigned long v = addr + i * PAGE_SIZE;
+			struct page *page;
+			struct folio *folio;
+
+			if (is_vmalloc_addr((void *)v))
+				page = vmalloc_to_page((void *)v);
+			else
+				page = virt_to_page((void *)v);
+
+			if (!page)
+				continue;
+
+			folio = page_folio(page);
+			if (folio == last)
+				continue;
+			last = folio;
+
+			folio_lock(folio);
+			try_to_migrate(folio, TTU_SYNC | TTU_BATCH_FLUSH);
+			folio_unlock(folio);
+		}
+
+		try_to_unmap_flush();
+		*out_count = 0;
+		return NULL;
+	}
+
+	for (i = 0; i < numpages; i++) {
+		unsigned long v = addr + i * PAGE_SIZE;
+		struct page *page;
+		struct folio *folio;
+
+		if (is_vmalloc_addr((void *)v))
+			page = vmalloc_to_page((void *)v);
+		else
+			page = virt_to_page((void *)v);
+
+		if (!page)
+			continue;
+
+		folio = page_folio(page);
+		if (folio == last)
+			continue;
+		last = folio;
+
+		/* Pin folio for the duration of conversion */
+		folio_get(folio);
+
+		folio_lock(folio);
+		try_to_migrate(folio, TTU_SYNC | TTU_BATCH_FLUSH);
+		folio_unlock(folio);
+
+		blocked[count++] = folio;
+	}
+
+	/* Ensure all batched unmaps are visible before proceeding */
+	try_to_unmap_flush();
+	*out_count = count;
+	return blocked;
+}
+
+static void mem_enc_restore_concurrent_access(unsigned long addr, int numpages, struct folio **blocked, unsigned int count)
+{
+	unsigned int i;
+
+	if (!blocked || !count)
+		return;
+
+	for (i = 0; i < count; i++) {
+		struct folio *folio = blocked[i];
+
+		remove_migration_ptes(folio, folio, 0);
+		folio_put(folio);
+	}
+	kfree(blocked);
+}
+
 static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc)
 {
 	pgprot_t empty = __pgprot(0);
 	struct cpa_data cpa;
 	int ret;
+	struct folio **blocked_list = NULL;
+	unsigned int blocked_count = 0;
 
 	/* Should not be working on unaligned addresses */
 	if (WARN_ONCE(addr & ~PAGE_MASK, "misaligned address: %#lx\n", addr))
@@ -2400,6 +2492,14 @@ static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc)
 	kmap_flush_unused();
 	vm_unmap_aliases();
 
+	/*
+	 * For confidential-computing guests, gate concurrent user mappings by
+	 * installing migration entries so that concurrent accesses fault and wait
+	 * while we flip the C-bit and coordinate with the VMM.
+	 */
+	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
+		blocked_list = mem_enc_block_concurrent_access(addr, numpages, &blocked_count);
+
 	/* Flush the caches as needed before changing the encryption attribute. */
 	if (x86_platform.guest.enc_tlb_flush_required(enc))
 		cpa_flush(&cpa, x86_platform.guest.enc_cache_flush_required());
@@ -2407,7 +2507,7 @@ static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc)
 	/* Notify hypervisor that we are about to set/clr encryption attribute. */
 	ret = x86_platform.guest.enc_status_change_prepare(addr, numpages, enc);
 	if (ret)
-		goto vmm_fail;
+		goto vmm_fail_restore;
 
 	ret = __change_page_attr_set_clr(&cpa, 1);
 
@@ -2421,14 +2521,30 @@ static int __set_memory_enc_pgtable(unsigned long addr, int numpages, bool enc)
 	cpa_flush(&cpa, 0);
 
 	if (ret)
-		return ret;
+		goto restore_and_out;
 
 	/* Notify hypervisor that we have successfully set/clr encryption attribute. */
 	ret = x86_platform.guest.enc_status_change_finish(addr, numpages, enc);
 	if (ret)
-		goto vmm_fail;
+		goto vmm_fail_restore;
+
+	/* Restore blocked mappings (if any) */
+	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
+		mem_enc_restore_concurrent_access(addr, numpages, blocked_list, blocked_count);
 
 	return 0;
+
+vmm_fail_restore:
+	/* On failure, restore blocked mappings before returning */
+	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
+		mem_enc_restore_concurrent_access(addr, numpages, blocked_list, blocked_count);
+	goto vmm_fail;
+
+restore_and_out:
+	/* On failure after page attribute change, also restore mappings */
+	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT))
+		mem_enc_restore_concurrent_access(addr, numpages, blocked_list, blocked_count);
+	return ret;
 
 vmm_fail:
 	WARN_ONCE(1, "CPA VMM failure to convert memory (addr=%p, numpages=%d) to %s: %d\n",
