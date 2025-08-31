@@ -1,0 +1,67 @@
+# Kconfig for strict pin validator
+
+config DEBUG_VM_STRICT_PIN_CHECK
+	bool "Strict pin user page validation"
+	depends on DEBUG_VM
+	default n
+	help
+	  Enable strict validation of pin user page status. This adds
+	  comprehensive checks to detect when operations are attempted
+	  on pinned pages that should not be pinned.
+	  
+	  When enabled, the kernel will:
+	  - Perform detailed analysis of page reference counts
+	  - Distinguish between different types of page references
+	  - Provide precise pin count information for large folios
+	  - Generate detailed error messages with call stack traces
+	  - Optionally panic on pin violations (when CONFIG_DEBUG_VM is set)
+	  
+	  This is useful for:
+	  - Debugging memory management issues
+	  - Validating that memory operations respect pin constraints
+	  - Detecting incorrect pin/unpin usage patterns
+	  - Performance analysis of pin-sensitive code paths
+	  
+	  The validation includes:
+	  - Process-level pin tracking (MMF_HAS_PINNED flag)
+	  - Folio-level precise tracking (for large folios)
+	  - Reference count analysis (for small folios)
+	  - Special page handling (zero pages, etc.)
+	  
+	  Note: This may have a small performance impact due to additional
+	  checks, so it should primarily be used for debugging and validation.
+	  
+	  If unsure, say N.
+
+config DEBUG_PIN_VALIDATOR_VERBOSE
+	bool "Verbose pin validation messages"
+	depends on DEBUG_VM_STRICT_PIN_CHECK
+	default n
+	help
+	  Enable verbose logging for pin validation operations.
+	  This will generate detailed messages for every pin check,
+	  including successful validations.
+	  
+	  Warning: This can generate a lot of log output and may
+	  impact system performance. Only enable for detailed debugging.
+	  
+	  If unsure, say N.
+
+config DEBUG_PIN_VALIDATOR_STATS
+	bool "Pin validation statistics"
+	depends on DEBUG_VM_STRICT_PIN_CHECK
+	default y
+	help
+	  Collect and expose statistics about pin validation operations
+	  through /proc/vmstat and debugfs.
+	  
+	  Statistics include:
+	  - Number of pin checks performed
+	  - Number of pin violations detected
+	  - Breakdown by validation result type
+	  - Performance metrics
+	  
+	  This information can be useful for understanding pin usage
+	  patterns and optimizing pin-sensitive code paths.
+	  
+	  If unsure, say Y.
